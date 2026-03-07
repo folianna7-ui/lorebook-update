@@ -26,6 +26,13 @@ Find important entities: characters, places, objects, factions, events, relation
 - Entry "content" MUST be written in ENGLISH only.
 - Entry "comment" (title) MUST be in ENGLISH only.
 
+═══ PARAGRAPH / NEWLINE PRESERVATION ═══
+EXISTING entries are shown with their newlines encoded as the literal token [NL].
+When you write the "content" field in your JSON response, you MUST use [NL] tokens wherever a newline belongs.
+Example: "[LOCATION: The Tower][NL][NL][Floor 1]: Cold, dark.[NL][Floor 2]: Warm."
+This is critical — do NOT collapse paragraphs or sections into one block of text.
+For UPDATE entries: copy the FULL CONTENT exactly as given (with [NL] tokens) and only insert new information.
+
 ═══ KEYWORDS — RUSSIAN ONLY, FULL DECLENSION CLUSTERS ═══
 Generate 10–20 keywords in Russian for each entry. All required grammatical forms must be included per keyword.
 Format each keyword as a declension cluster: "слово, слова, слову, словом, о слове"
@@ -73,7 +80,7 @@ Respond ONLY with this exact JSON (no markdown, no extra text):
       "action": "update",
       "uid": 42,
       "comment": "Existing entry title",
-      "content": "FULL original content in English + new info merged in. Must preserve ALL existing text and formatting.",
+      "content": "FULL original content in English + new info merged in.[NL][NL]New section added: some new fact from chat. Must preserve ALL existing text and [NL] tokens.",
       "keys": ["слово, слова, слову, словом, о слове"],
       "reason": "What specific new info was added from the recent chat"
     }
@@ -375,7 +382,12 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
         const keys = (e.key||[]).join(' | ');
         const meta = `order:${e.order??'?'} depth:${e.depth??'?'} position:${e.position??'?'}`;
         lines.push(`  uid:${e.uid} | "${e.comment||''}" | ${meta} | keys:[${keys}]`);
-        if (e.content) lines.push(`  FULL CONTENT:\n${e.content}\n  --- END OF ENTRY ---`);
+        if (e.content) {
+          // Encode newlines as [NL] so the AI preserves paragraph structure in its JSON output.
+          // We decode [NL] → actual newlines after parsing the response.
+          const encoded = e.content.replace(/\r\n/g,'[NL]').replace(/\n/g,'[NL]');
+          lines.push(`  FULL CONTENT (newlines encoded as [NL]):\n${encoded}\n  --- END OF ENTRY ---`);
+        }
       });
     }
     return lines.join('\n')||'(no entries)';
@@ -404,10 +416,29 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
     });
     return arr.map((e,i)=>{
       const existing = (e.action==='update'&&e.uid!=null) ? (uidEntry[e.uid]||null) : null;
+
+      // Decode [NL] tokens back to real newlines
+      let decodedContent = (e.content||'').replace(/\[NL\]/g, '\n');
+
+      // Safety-net: if this is an update and the existing entry had significant paragraph
+      // structure but the AI returned flat text (no newlines at all), try to recover.
+      if (existing && e.action==='update' && decodedContent) {
+        const origNewlines = (existing.content||'').split('\n').length - 1;
+        const newNewlines  = decodedContent.split('\n').length - 1;
+        // If original had 3+ newlines but AI gave 0 — structure was almost certainly collapsed
+        if (origNewlines >= 3 && newNewlines === 0) {
+          // Heuristic: existing content likely uses [...]: headers — try to insert newlines before them
+          decodedContent = decodedContent
+            .replace(/\s*(\[[^\]]+\]:?)/g, '\n\n$1')  // newline before [Section]: patterns
+            .replace(/^\n+/, '');                           // trim leading newlines
+          console.warn('[LAU] Recovered paragraph structure for uid', e.uid);
+        }
+      }
+
       return {
         _id:`lau_${Date.now()}_${i}`,
         action:e.action||'create', uid:e.uid??null,
-        comment:e.comment||`Entry ${i+1}`, content:e.content||'',
+        comment:(e.comment||`Entry ${i+1}`).replace(/\[NL\]/g,' '), content:decodedContent,
         keys:Array.isArray(e.keys)?e.keys:[], secondary_keys:[],
         // For updates: preserve existing order/depth/position; for creates: use AI suggestion
         order:   existing ? (existing.order??100)    : (e.order??500),
