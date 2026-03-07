@@ -22,38 +22,67 @@ Find important entities: characters, places, objects, factions, events, relation
 - For NEW entities not yet in the lorebook: create a new entry.
 - If nothing meaningful is new — return empty entries array.
 
-CRITICAL RULE FOR UPDATES:
+═══ CONTENT LANGUAGE ═══
+- Entry "content" MUST be written in ENGLISH only.
+- Entry "comment" (title) MUST be in ENGLISH only.
+
+═══ KEYWORDS — RUSSIAN ONLY, FULL DECLENSION CLUSTERS ═══
+Generate 10–20 keywords in Russian for each entry. All required grammatical forms must be included per keyword.
+Format each keyword as a declension cluster: "слово, слова, слову, словом, о слове"
+Keywords MUST be:
+- Concrete and scene-specific: locations, objects, proper nouns, unique actions, repeated motifs
+- One concept per keyword — do NOT combine multiple ideas
+- Useful for retrieval when the noun or action is mentioned alone in chat
+- Include all grammatical forms (nominative, genitive, dative, accusative, instrumental, prepositional)
+Keywords MUST NOT be:
+- Abstract or thematic: близость, доверие, уязвимость, власть, динамика, граница, тоска
+- Compound or narrative descriptions: "первая встреча в библиотеке"
+- Names of the two main RP characters
+- Anything that only makes sense when the full scene is remembered
+Prefer: proper nouns, specific objects, distinctive actions, unique phrases, aura states, named magic events.
+EXAMPLE of correct keyword format: ["Цитадель, Цитадели, Цитадели, Цитадель, Цитаделью, о Цитадели", "печать, печати, печати, печать, печатью, о печати"]
+
+═══ CRITICAL RULE FOR UPDATES ═══
 When writing "content" for an "update" action, you MUST:
 1. Start with the COMPLETE EXISTING CONTENT of that entry (provided below as FULL CONTENT).
 2. APPEND or INTEGRATE the new information from chat into it.
 3. NEVER delete, shorten, or omit any existing information.
 4. The updated content must be a SUPERSET of the original — always longer or equal, never shorter.
 5. Only add genuinely NEW facts that appeared in the recent chat.
+6. PRESERVE the existing formatting style (headers, bullet points, sections, markdown) of the original entry.
+
+═══ ORDER / DEPTH / POSITION FOR NEW ENTRIES ═══
+When creating a NEW entry, analyze the existing entries listed below (they show order, depth, position values).
+Assign "order", "depth", and "position" that fit the entry's semantic category, following the patterns you see.
+If you cannot determine appropriate values — use order:500, depth:4, position:0 as defaults.
 
 Respond ONLY with this exact JSON (no markdown, no extra text):
 {
   "entries": [
     {
       "action": "create",
-      "comment": "Entry title",
-      "content": "Full lorebook entry text.",
-      "keys": ["keyword1", "keyword2"],
+      "comment": "Entry title in English",
+      "content": "Full lorebook entry text in English.",
+      "keys": ["слово, слова, слову, словом, о слове", "другое, другого, другому, другое, другим, о другом"],
+      "order": 500,
+      "depth": 4,
+      "position": 0,
       "reason": "Why this entry is being created"
     },
     {
       "action": "update",
       "uid": 42,
       "comment": "Existing entry title",
-      "content": "FULL original content + new info merged in. Must preserve ALL existing text.",
-      "keys": ["keyword1", "keyword2"],
+      "content": "FULL original content in English + new info merged in. Must preserve ALL existing text and formatting.",
+      "keys": ["слово, слова, слову, словом, о слове"],
       "reason": "What specific new info was added from the recent chat"
     }
   ]
 }
 
 Rules:
-- Write entry content in third person, present tense, concise but complete.
-- 2-4 trigger keywords per entry.
+- Content and titles in ENGLISH only.
+- Keywords in RUSSIAN only, full declension clusters.
 - For "update" you MUST include the uid of the existing entry.
 - Never duplicate existing entries unless genuinely updating them.
 - If unsure whether to update — skip it. Only update when new facts are clearly present in chat.`,
@@ -343,8 +372,9 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
       const entries = Object.values(data?.entries||{});
       lines.push(`[Lorebook: "${name}" — ${entries.length} entries]`);
       entries.forEach(e => {
-        const keys = (e.key||[]).join(', ');
-        lines.push(`  uid:${e.uid} | "${e.comment||''}" | keys:[${keys}]`);
+        const keys = (e.key||[]).join(' | ');
+        const meta = `order:${e.order??'?'} depth:${e.depth??'?'} position:${e.position??'?'}`;
+        lines.push(`  uid:${e.uid} | "${e.comment||''}" | ${meta} | keys:[${keys}]`);
         if (e.content) lines.push(`  FULL CONTENT:\n${e.content}\n  --- END OF ENTRY ---`);
       });
     }
@@ -367,15 +397,34 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
       Object.values(data?.entries||{}).forEach(e=>{uidBook[e.uid]=name;});
     });
     const s=getSettings();
-    return arr.map((e,i)=>({
-      _id:`lau_${Date.now()}_${i}`,
-      action:e.action||'create', uid:e.uid??null,
-      comment:e.comment||`Entry ${i+1}`, content:e.content||'',
-      keys:Array.isArray(e.keys)?e.keys:[], secondary_keys:[],
-      order:e.order??100, reason:e.reason||'',
-      targetBook:(e.uid!=null&&uidBook[e.uid])?uidBook[e.uid]:(s.selectedBooks[0]||''),
-      applied:false,
-    }));
+    // Build uid→existing-entry map so we can copy settings for updates
+    const uidEntry={};
+    Object.values(books).forEach(data=>{
+      Object.values(data?.entries||{}).forEach(ex=>{uidEntry[ex.uid]=ex;});
+    });
+    return arr.map((e,i)=>{
+      const existing = (e.action==='update'&&e.uid!=null) ? (uidEntry[e.uid]||null) : null;
+      return {
+        _id:`lau_${Date.now()}_${i}`,
+        action:e.action||'create', uid:e.uid??null,
+        comment:e.comment||`Entry ${i+1}`, content:e.content||'',
+        keys:Array.isArray(e.keys)?e.keys:[], secondary_keys:[],
+        // For updates: preserve existing order/depth/position; for creates: use AI suggestion
+        order:   existing ? (existing.order??100)    : (e.order??500),
+        depth:   existing ? (existing.depth??4)      : (e.depth??4),
+        position:existing ? (existing.position??0)   : (e.position??0),
+        // Preserve ALL existing entry metadata for updates
+        _existingMeta: existing ? {
+          constant:existing.constant, selective:existing.selective,
+          addMemo:existing.addMemo, disable:existing.disable,
+          role:existing.role, strategy:existing.strategy,
+          secondary_key:existing.secondary_key,
+        } : null,
+        reason:e.reason||'',
+        targetBook:(e.uid!=null&&uidBook[e.uid])?uidBook[e.uid]:(s.selectedBooks[0]||''),
+        applied:false,
+      };
+    });
   }
 
   // ─── Auto-scan ────────────────────────────────────────────────────────────
@@ -726,7 +775,9 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
     <div class="lau-f-row">
       <div class="lau-f-group"><div class="lau-f-label">Primary keywords</div><input class="lau-f-input f-keys" type="text" value="${esc(entry.keys.join(', '))}"/></div>
       <div class="lau-f-group"><div class="lau-f-label">Secondary keywords</div><input class="lau-f-input f-seckeys" type="text" value="${esc(entry.secondary_keys.join(', '))}"/></div>
-      <div class="lau-f-group" style="max-width:80px"><div class="lau-f-label">Order</div><input class="lau-f-input f-order" type="number" value="${entry.order}"/></div>
+      <div class="lau-f-group" style="max-width:72px"><div class="lau-f-label">Order</div><input class="lau-f-input f-order" type="number" value="${entry.order}"/></div>
+      <div class="lau-f-group" style="max-width:60px"><div class="lau-f-label">Depth</div><input class="lau-f-input f-depth" type="number" value="${entry.depth??4}"/></div>
+      <div class="lau-f-group" style="max-width:68px"><div class="lau-f-label">Position</div><input class="lau-f-input f-position" type="number" value="${entry.position??0}"/></div>
     </div>
     <div class="lau-f-row">
       <div class="lau-f-group"><div class="lau-f-label">Target lorebook</div><select class="lau-f-select f-book">${bOpts}</select></div>
@@ -792,7 +843,7 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
       e.comment=g('.f-comment')||e.comment;e.content=g('.f-content')||e.content;
       e.keys=(g('.f-keys')||'').split(',').map(s=>s.trim()).filter(Boolean);
       e.secondary_keys=(g('.f-seckeys')||'').split(',').map(s=>s.trim()).filter(Boolean);
-      e.order=parseInt(g('.f-order'))||100;e.targetBook=g('.f-book')||e.targetBook;e.action=g('.f-action')||e.action;
+      e.order=parseInt(g('.f-order'))||500;e.depth=parseInt(g('.f-depth'))||4;e.position=parseInt(g('.f-position'))||0;e.targetBook=g('.f-book')||e.targetBook;e.action=g('.f-action')||e.action;
     });
   }
 
@@ -819,19 +870,41 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
 
     if(entry.action==='update'&&entry.uid!=null&&data.entries[entry.uid]){
       const ex=data.entries[entry.uid];
-      ex.key=entry.keys;ex.comment=entry.comment;ex.content=entry.content;ex.order=entry.order;
-      if(entry.secondary_keys.length)ex.secondary_key=entry.secondary_keys;
+      // Update only content/keys/title — preserve ALL other settings (order, depth, position, strategy, etc.)
+      ex.comment=entry.comment;
+      ex.content=entry.content;
+      ex.key=entry.keys;
+      // Only update secondary_key if explicitly provided
+      if(entry.secondary_keys&&entry.secondary_keys.length) ex.secondary_key=entry.secondary_keys;
+      // Do NOT touch: ex.order, ex.depth, ex.position, ex.constant, ex.selective,
+      //               ex.disable, ex.role, ex.strategy, ex.addMemo — preserve as-is
     } else {
       let ne;
       if(typeof c.createWorldInfoEntry==='function') ne=c.createWorldInfoEntry(bookName,data);
       if(!ne){
         const uids=Object.keys(data.entries).map(Number).filter(n=>!isNaN(n));
         const uid=uids.length?Math.max(...uids)+1:0;
-        ne={uid,key:[],secondary_key:[],comment:'',content:'',constant:false,selective:false,addMemo:false,order:100,position:0,disable:false,depth:4,role:0};
+        ne={uid,key:[],secondary_key:[],comment:'',content:'',constant:false,selective:false,
+            addMemo:false,order:500,position:0,disable:false,depth:4,role:0};
         data.entries[uid]=ne;
       }
-      ne.key=entry.keys;ne.comment=entry.comment;ne.content=entry.content;ne.order=entry.order;ne.addMemo=!!entry.comment;
-      if(entry.secondary_keys.length)ne.secondary_key=entry.secondary_keys;
+      ne.key=entry.keys;
+      ne.comment=entry.comment;
+      ne.content=entry.content;
+      ne.addMemo=!!entry.comment;
+      // Apply AI-suggested or user-edited values for new entries
+      ne.order    = entry.order    ?? 500;
+      ne.depth    = entry.depth    ?? 4;
+      ne.position = entry.position ?? 0;
+      // Apply preserved metadata if copied from a similar existing entry
+      if(entry._existingMeta){
+        const m=entry._existingMeta;
+        if(m.constant!=null)  ne.constant  = m.constant;
+        if(m.selective!=null) ne.selective = m.selective;
+        if(m.role!=null)      ne.role      = m.role;
+        if(m.strategy!=null)  ne.strategy  = m.strategy;
+      }
+      if(entry.secondary_keys&&entry.secondary_keys.length) ne.secondary_key=entry.secondary_keys;
     }
 
     await c.saveWorldInfo(bookName,data);
