@@ -33,21 +33,23 @@ Example: "[LOCATION: The Tower][NL][NL][Floor 1]: Cold, dark.[NL][Floor 2]: Warm
 This is critical — do NOT collapse paragraphs or sections into one block of text.
 For UPDATE entries: copy the FULL CONTENT exactly as given (with [NL] tokens) and only insert new information.
 
-═══ KEYWORDS — RUSSIAN ONLY, FULL DECLENSION CLUSTERS ═══
-Generate 10–20 keywords in Russian for each entry. All required grammatical forms must be included per keyword.
-Format each keyword as a declension cluster: "слово, слова, слову, словом, о слове"
-Keywords MUST be:
-- Concrete and scene-specific: locations, objects, proper nouns, unique actions, repeated motifs
-- One concept per keyword — do NOT combine multiple ideas
-- Useful for retrieval when the noun or action is mentioned alone in chat
-- Include all grammatical forms (nominative, genitive, dative, accusative, instrumental, prepositional)
-Keywords MUST NOT be:
-- Abstract or thematic: близость, доверие, уязвимость, власть, динамика, граница, тоска
-- Compound or narrative descriptions: "первая встреча в библиотеке"
-- Names of the two main RP characters
-- Anything that only makes sense when the full scene is remembered
-Prefer: proper nouns, specific objects, distinctive actions, unique phrases, aura states, named magic events.
-EXAMPLE of correct keyword format: ["Цитадель, Цитадели, Цитадели, Цитадель, Цитаделью, о Цитадели", "печать, печати, печати, печать, печатью, о печати"]
+═══ KEYWORDS — NEW ENTRIES ONLY (RUSSIAN, FULL DECLENSION CLUSTERS) ═══
+For UPDATE entries: omit the "keys" field entirely — keywords are preserved automatically from the existing entry.
+For CREATE entries only: generate 10–20 keywords in Russian.
+
+STRICT FORMAT — each keyword must be ONE string containing ALL 6 grammatical case forms, comma-separated:
+  "nominative, genitive, dative, accusative, instrumental, prepositional"
+  Example: "башня, башни, башне, башню, башней, о башне"
+  Example: "кабинет директора, кабинета директора, кабинету директора, кабинет директора, кабинетом директора, о кабинете директора"
+  Example: "шпиль, шпиля, шпилю, шпиль, шпилём, о шпиле"
+
+Each keyword = ONE concept, ONE string with 6 forms. DO NOT put multiple concepts in one string.
+DO NOT write: "башня, кабинет" — that mixes two concepts.
+DO write separate entries: "башня, башни, башне, башню, башней, о башне" AND "кабинет, кабинета, кабинету, кабинет, кабинетом, о кабинете"
+
+Keywords MUST be concrete: locations, objects, proper nouns, unique actions, named magic, physical items.
+Keywords MUST NOT be abstract: близость, доверие, власть, динамика, тоска, уязвимость.
+Keywords MUST NOT be names of the two main RP characters.
 
 ═══ CRITICAL RULE FOR UPDATES ═══
 When writing "content" for an "update" action, you MUST:
@@ -70,7 +72,11 @@ Respond ONLY with this exact JSON (no markdown, no extra text):
       "action": "create",
       "comment": "Entry title in English",
       "content": "Full lorebook entry text in English.",
-      "keys": ["слово, слова, слову, словом, о слове", "другое, другого, другому, другое, другим, о другом"],
+      "keys": [
+        "башня, башни, башне, башню, башней, о башне",
+        "кабинет директора, кабинета директора, кабинету директора, кабинет директора, кабинетом директора, о кабинете директора",
+        "шпиль, шпиля, шпилю, шпиль, шпилём, о шпиле"
+      ],
       "order": 500,
       "depth": 4,
       "position": 0,
@@ -80,8 +86,7 @@ Respond ONLY with this exact JSON (no markdown, no extra text):
       "action": "update",
       "uid": 42,
       "comment": "Existing entry title",
-      "content": "FULL original content in English + new info merged in.[NL][NL]New section added: some new fact from chat. Must preserve ALL existing text and [NL] tokens.",
-      "keys": ["слово, слова, слову, словом, о слове"],
+      "content": "FULL original content in English + new info merged in.[NL][NL][New Section]: some new fact from chat. Must preserve ALL existing text and [NL] tokens.",
       "reason": "What specific new info was added from the recent chat"
     }
   ]
@@ -89,7 +94,8 @@ Respond ONLY with this exact JSON (no markdown, no extra text):
 
 Rules:
 - Content and titles in ENGLISH only.
-- Keywords in RUSSIAN only, full declension clusters.
+- For "create": include "keys" array with Russian declension clusters (6 forms per keyword).
+- For "update": do NOT include "keys" or "comment" — they are taken from the existing entry automatically.
 - For "update" you MUST include the uid of the existing entry.
 - Never duplicate existing entries unless genuinely updating them.
 - If unsure whether to update — skip it. Only update when new facts are clearly present in chat.`,
@@ -381,7 +387,9 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
       entries.forEach(e => {
         const keys = (e.key||[]).join(' | ');
         const meta = `order:${e.order??'?'} depth:${e.depth??'?'} position:${e.position??'?'}`;
-        lines.push(`  uid:${e.uid} | "${e.comment||''}" | ${meta} | keys:[${keys}]`);
+        lines.push(`  uid:${e.uid} | "${e.comment||''}" | ${meta}`);
+        // Show existing keys as a reference (AI must NOT modify these for updates)
+        if ((e.key||[]).length) lines.push(`  EXISTING_KEYS (preserved as-is for update): ${JSON.stringify(e.key)}`);
         if (e.content) {
           // Encode newlines as [NL] so the AI preserves paragraph structure in its JSON output.
           // We decode [NL] → actual newlines after parsing the response.
@@ -435,11 +443,25 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
         }
       }
 
+      // For updates: always use original title and keywords from existing entry.
+      // AI-generated keywords for updates are unreliable and break the declension cluster format.
+      const useComment = existing
+        ? (existing.comment || e.comment || `Entry ${i+1}`)
+        : (e.comment || `Entry ${i+1}`).replace(/\[NL\]/g,' ');
+
+      const useKeys = existing
+        ? (existing.key || [])   // preserve original Russian declension clusters exactly
+        : (Array.isArray(e.keys) ? e.keys : []);
+
+      const useSecondaryKeys = existing
+        ? (existing.secondary_key || [])
+        : [];
+
       return {
         _id:`lau_${Date.now()}_${i}`,
         action:e.action||'create', uid:e.uid??null,
-        comment:(e.comment||`Entry ${i+1}`).replace(/\[NL\]/g,' '), content:decodedContent,
-        keys:Array.isArray(e.keys)?e.keys:[], secondary_keys:[],
+        comment:useComment, content:decodedContent,
+        keys:useKeys, secondary_keys:useSecondaryKeys,
         // For updates: preserve existing order/depth/position; for creates: use AI suggestion
         order:   existing ? (existing.order??100)    : (e.order??500),
         depth:   existing ? (existing.depth??4)      : (e.depth??4),
