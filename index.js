@@ -52,13 +52,24 @@ Keywords MUST NOT be abstract: близость, доверие, власть, �
 Keywords MUST NOT be names of the two main RP characters.
 
 ═══ CRITICAL RULE FOR UPDATES ═══
+Before proposing any update, ask yourself:
+  "Is this entry's TOPIC (its title/subject) explicitly mentioned or discussed in the recent chat?"
+  If NO — do NOT suggest an update. Return nothing for this entry.
+
 When writing "content" for an "update" action, you MUST:
-1. Start with the COMPLETE EXISTING CONTENT of that entry (provided below as FULL CONTENT).
+1. COPY the FULL_CONTENT of the entry with that uid, EXACTLY as shown between ENTRY_START and ENTRY_END.
+   — Use that uid's FULL_CONTENT. Do NOT use content from a different uid.
 2. APPEND or INTEGRATE the new information from chat into it.
 3. NEVER delete, shorten, or omit any existing information.
 4. The updated content must be a SUPERSET of the original — always longer or equal, never shorter.
 5. Only add genuinely NEW facts that appeared in the recent chat.
-6. PRESERVE the existing formatting style (headers, bullet points, sections, markdown) of the original entry.
+6. PRESERVE the existing formatting style ([Section]: headers, bullet points, markdown) of the original entry.
+7. Keep all [NL] tokens from the original. Add [NL][NL] before any new section you append.
+
+ANTI-HALLUCINATION RULE:
+— Each uid refers to exactly one entry. The content you write for uid:42 must be based on the FULL_CONTENT shown between "ENTRY_START uid:42" and "ENTRY_END uid:42".
+— It is a CRITICAL ERROR to put uid:42's content into uid:7, or to mix content from different entries.
+— If the recent chat has no new information relevant to a specific entry — omit that entry entirely from your response.
 
 ═══ ORDER / DEPTH / POSITION FOR NEW ENTRIES ═══
 When creating a NEW entry, analyze the existing entries listed below (they show order, depth, position values).
@@ -85,9 +96,8 @@ Respond ONLY with this exact JSON (no markdown, no extra text):
     {
       "action": "update",
       "uid": 42,
-      "comment": "Existing entry title",
-      "content": "FULL original content in English + new info merged in.[NL][NL][New Section]: some new fact from chat. Must preserve ALL existing text and [NL] tokens.",
-      "reason": "What specific new info was added from the recent chat"
+      "content": "Copy FULL_CONTENT from ENTRY_START uid:42 here + [NL][NL][New Section]: new fact from chat.",
+      "reason": "What specific new info from recent chat was added, and which messages mention this entry's topic"
     }
   ]
 }
@@ -383,19 +393,20 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
     const lines = [];
     for (const [name,data] of Object.entries(books)) {
       const entries = Object.values(data?.entries||{});
-      lines.push(`[Lorebook: "${name}" — ${entries.length} entries]`);
+      lines.push(`====== LOREBOOK: "${name}" (${entries.length} entries) ======`);
       entries.forEach(e => {
-        const keys = (e.key||[]).join(' | ');
         const meta = `order:${e.order??'?'} depth:${e.depth??'?'} position:${e.position??'?'}`;
-        lines.push(`  uid:${e.uid} | "${e.comment||''}" | ${meta}`);
-        // Show existing keys as a reference (AI must NOT modify these for updates)
-        if ((e.key||[]).length) lines.push(`  EXISTING_KEYS (preserved as-is for update): ${JSON.stringify(e.key)}`);
+        // Each entry is wrapped in unambiguous start/end tags with uid repeated in both
+        lines.push(`\n>>>>> ENTRY_START uid:${e.uid} <<<<<`);
+        lines.push(`TITLE: ${e.comment||'(no title)'}`);
+        lines.push(`META: ${meta}`);
+        if ((e.key||[]).length) lines.push(`EXISTING_KEYS (do not change on update): ${JSON.stringify(e.key)}`);
         if (e.content) {
-          // Encode newlines as [NL] so the AI preserves paragraph structure in its JSON output.
-          // We decode [NL] → actual newlines after parsing the response.
           const encoded = e.content.replace(/\r\n/g,'[NL]').replace(/\n/g,'[NL]');
-          lines.push(`  FULL CONTENT (newlines encoded as [NL]):\n${encoded}\n  --- END OF ENTRY ---`);
+          lines.push(`FULL_CONTENT (newlines=[NL]):`);
+          lines.push(encoded);
         }
+        lines.push(`<<<<< ENTRY_END uid:${e.uid} >>>>>`);
       });
     }
     return lines.join('\n')||'(no entries)';
@@ -422,7 +433,44 @@ Based on the chat above, suggest lorebook actions. Respond with JSON only.`;
     Object.values(books).forEach(data=>{
       Object.values(data?.entries||{}).forEach(ex=>{uidEntry[ex.uid]=ex;});
     });
-    return arr.map((e,i)=>{
+    // ── Validate updates before processing ──────────────────────────────────
+    const validated = arr.filter((e, i) => {
+      if (e.action !== 'update') return true;
+
+      const uid = e.uid;
+      const existing = uid != null ? uidEntry[uid] : null;
+
+      // 1) uid must exist in the known entries
+      if (!existing) {
+        console.warn(`[LAU] Dropped update: uid ${uid} not found in lorebook.`);
+        return false;
+      }
+
+      // 2) Content must be provided
+      const rawContent = (e.content||'').replace(/\[NL\]/g,'\n').trim();
+      if (!rawContent) {
+        console.warn(`[LAU] Dropped update uid ${uid}: empty content.`);
+        return false;
+      }
+
+      // 3) Updated content must be >= 80% of original length (not stripped/replaced)
+      const origLen = (existing.content||'').trim().length;
+      if (origLen > 100 && rawContent.length < origLen * 0.8) {
+        console.warn(`[LAU] Dropped update uid ${uid} "${existing.comment}": content shrank from ${origLen} to ${rawContent.length} chars (likely wrong content).`);
+        return false;
+      }
+
+      // 4) First 60 chars of original must appear somewhere in the new content (topic continuity)
+      const origStart = (existing.content||'').trim().slice(0, 60).toLowerCase();
+      if (origStart.length > 20 && !rawContent.toLowerCase().includes(origStart)) {
+        console.warn(`[LAU] Dropped update uid ${uid} "${existing.comment}": opening of original not found in new content (likely content from wrong entry).`);
+        return false;
+      }
+
+      return true;
+    });
+
+    return validated.map((e,i)=>{
       const existing = (e.action==='update'&&e.uid!=null) ? (uidEntry[e.uid]||null) : null;
 
       // Decode [NL] tokens back to real newlines
