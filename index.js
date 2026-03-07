@@ -251,7 +251,7 @@ Rules:
 
   // ─── Prompt builder ───────────────────────────────────────────────────────
 
-  function buildBookPrompt(bookName, bookData, msgs, meta) {
+  function buildBookPrompt(bookName, bookData, msgs, meta, allBooks) {
     const tag      = meta?.tag || 'world';
     const tagInfo  = BOOK_TAGS[tag] || BOOK_TAGS.world;
     const desc     = meta?.description?.trim();
@@ -280,11 +280,26 @@ Rules:
       lines.push(`<<<<< ENTRY_END uid:${e.uid} >>>>>`);
     });
 
+    // Cross-book index: tell AI about entries in OTHER books so it won't recreate them
+    let crossBookSection = '';
+    if (allBooks && Object.keys(allBooks).length > 1) {
+      const otherEntries = [];
+      Object.entries(allBooks).forEach(([oBook, oData]) => {
+        if (oBook === bookName) return;
+        Object.values(oData?.entries || {}).forEach(oe => {
+          if (oe.comment) otherEntries.push(`  - "${oe.comment}" (uid:${oe.uid} in "${oBook}")`);
+        });
+      });
+      if (otherEntries.length) {
+        crossBookSection = `=== ENTRIES THAT ALREADY EXIST IN OTHER LOREBOOKS (do NOT recreate) ===\n${otherEntries.join('\n')}`;
+      }
+    }
+
     return `${prompt}
 
 ${lines.join('\n')}
 
-=== RECENT CHAT (last ${msgs.length} messages) ===
+${crossBookSection ? crossBookSection + '\n\n' : ''}=== RECENT CHAT (last ${msgs.length} messages) ===
 ${msgs.join('\n\n')}
 
 Based on the chat above, suggest lorebook actions for "${bookName}". Respond with JSON only.`;
@@ -338,7 +353,8 @@ Based on the chat above, suggest lorebook actions for "${bookName}". Respond wit
     return validated.map((e,i)=>{
       const existing=(e.action==='update'&&e.uid!=null)?(uidEntry[e.uid]||null):null;
 
-      let decodedContent=(e.content||'').replace(/\[NL\]/g,'\n');
+      // Decode [NL] tokens; also strip any [NL= prefix artifact from a malformed prompt
+      let decodedContent=(e.content||'').replace(/^\[NL=/,'').replace(/\[NL\]/g,'\n');
 
       // Safety: recover collapsed paragraph structure
       if(existing&&e.action==='update'&&decodedContent){
@@ -383,47 +399,60 @@ Based on the chat above, suggest lorebook actions for "${bookName}". Respond wit
 
   function computeDiff(original, updated) {
     if(!original) return `<span class="lau-diff-add">${esc(updated)}</span>`;
+    if(original === updated) return `<span class="lau-diff-same">${esc(updated)}</span>`;
 
-    // Line-level diff, then word-level for changed lines
     const origLines = original.split('\n');
     const newLines  = updated.split('\n');
 
-    // Find common prefix lines (unchanged header)
+    // Find longest common prefix (line-by-line)
     let pi = 0;
     while(pi < origLines.length && pi < newLines.length && origLines[pi] === newLines[pi]) pi++;
 
-    // Find common suffix lines
+    // Find longest common suffix (not overlapping the prefix)
     let si = 0;
-    while(si < origLines.length - pi && si < newLines.length - pi &&
-          origLines[origLines.length-1-si] === newLines[newLines.length-1-si]) si++;
+    const maxSi = Math.min(origLines.length - pi, newLines.length - pi);
+    while(si < maxSi && origLines[origLines.length-1-si] === newLines[newLines.length-1-si]) si++;
 
-    const commonPrefix = origLines.slice(0, pi);
-    const commonSuffix = si > 0 ? origLines.slice(origLines.length - si) : [];
-    const removedMid   = origLines.slice(pi, origLines.length - (si||0));
-    const addedMid     = newLines.slice(pi, newLines.length - (si||0));
+    const commonPrefixLines = origLines.slice(0, pi);
+    const commonSuffixLines = si > 0 ? origLines.slice(origLines.length - si) : [];
+    const removedMid        = origLines.slice(pi, si > 0 ? origLines.length - si : origLines.length);
+    const addedMid          = newLines.slice(pi, si > 0 ? newLines.length - si : newLines.length);
 
     const parts = [];
 
-    if(commonPrefix.length) {
-      parts.push(`<span class="lau-diff-same">${esc(commonPrefix.join('\n'))}${addedMid.length||removedMid.length?'\n':''}</span>`);
+    // Common prefix — shown dimmed
+    if(commonPrefixLines.length) {
+      // Only show last 3 lines of prefix to save space
+      const shown = commonPrefixLines.slice(-3);
+      if(commonPrefixLines.length > 3) parts.push('<span class="lau-diff-same" style="color:#334155">… (unchanged) …\n</span>');
+      parts.push(`<span class="lau-diff-same">${esc(shown.join('\n'))}\n</span>`);
     }
 
-    if(removedMid.length) {
+    // Removed lines (only show if the content genuinely shrank — shouldn't happen but show for safety)
+    if(removedMid.length && addedMid.length === 0) {
       parts.push(`<span class="lau-diff-del">${esc(removedMid.join('\n'))}</span>`);
-      if(addedMid.length) parts.push('\n');
     }
 
+    // Added/changed lines — the interesting part
     if(addedMid.length) {
-      // Word-level highlight within added section
-      const addedText = addedMid.join('\n');
-      const removedText = removedMid.join('\n');
-      const wordDiff = wordLevelDiff(removedText, addedText);
-      parts.push(wordDiff);
+      if(removedMid.length > 0) {
+        // Lines were changed: show word-level diff
+        const wordD = wordLevelDiff(removedMid.join('\n'), addedMid.join('\n'));
+        parts.push(wordD);
+      } else {
+        // Pure additions: highlight everything green
+        parts.push(`<span class="lau-diff-add">${esc(addedMid.join('\n'))}</span>`);
+      }
     }
 
-    if(commonSuffix.length) {
-      parts.push(`\n<span class="lau-diff-same">${esc(commonSuffix.join('\n'))}</span>`);
+    // Common suffix — shown dimmed (first 2 lines only)
+    if(commonSuffixLines.length) {
+      const shown = commonSuffixLines.slice(0, 2);
+      parts.push(`\n<span class="lau-diff-same">${esc(shown.join('\n'))}${commonSuffixLines.length > 2 ? '\n… (unchanged)' : ''}</span>`);
     }
+
+    // If nothing changed visually (edge case), show the whole new content
+    if(!parts.length) return `<span class="lau-diff-same">${esc(updated)}</span>`;
 
     return parts.join('');
   }
@@ -537,7 +566,7 @@ Based on the chat above, suggest lorebook actions for "${bookName}". Respond wit
       i++;
       setScanInfo(`🤖 Scanning book ${i}/${bookCount}: "${bookName}"…`,'info');
       const meta=getBookMeta(bookName);
-      const prompt=buildBookPrompt(bookName,bookData,msgs,meta);
+      const prompt=buildBookPrompt(bookName,bookData,msgs,meta,books);
       try{
         const raw=await aiGenerate(prompt);
         if(!raw?.trim()) continue;
@@ -570,7 +599,7 @@ Based on the chat above, suggest lorebook actions for "${bookName}". Respond wit
         lines.push(`TITLE: ${e.comment||'(no title)'}${lockMark}`);
         lines.push(`META: order:${e.order??'?'} depth:${e.depth??'?'} position:${e.position??'?'}`);
         if((e.key||[]).length) lines.push(`EXISTING_KEYS: ${JSON.stringify(e.key)}`);
-        if(e.content){const enc=e.content.replace(/\r\n/g,'[NL]').replace(/\n/g,'[NL]');lines.push(`FULL_CONTENT:[NL=${enc}`);}
+        if(e.content){const enc=e.content.replace(/\r\n/g,'[NL]').replace(/\n/g,'[NL]');lines.push('FULL_CONTENT (newlines=[NL]):');lines.push(enc);}
         lines.push(`<<<<< ENTRY_END uid:${e.uid} >>>>>`);
       });
     }
