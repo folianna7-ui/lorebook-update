@@ -293,3 +293,47 @@
   border-color: #166534 !important; font-weight: bold;
 }
 .lau-apply-btn:hover { background: #14532d !important; }
+
+/* ── v2.0 additions ── */
+
+/* Book tag emoji button */
+.lau-book-tag {
+  margin-left: auto; flex-shrink: 0;
+  font-size: 1em; cursor: pointer; padding: 2px 4px;
+  border-radius: 4px; transition: background 0.12s;
+  user-select: none;
+}
+.lau-book-tag:hover { background: rgba(255,255,255,0.1); }
+
+/* Book editor (tag/description row under book) */
+.lau-book-editor { background: rgba(0,0,0,0.15); }
+.lau-book-editor .lau-f-select { font-size: 0.8em; padding: 3px 5px; }
+
+/* Confidence badge colors */
+.lau-conf-high   { color: #4ade80; border-color: rgba(74,222,128,0.3); }
+.lau-conf-medium { color: #f59e0b; border-color: rgba(245,158,11,0.3); }
+.lau-conf-low    { color: #f87171; border-color: rgba(248,113,113,0.3); }
+
+/* Diff view */
+.lau-diff-wrap {
+  background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 5px; padding: 8px; margin-top: 4px;
+}
+.lau-diff-view {
+  font-family: monospace; font-size: 0.78em; line-height: 1.6;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 200px; overflow-y: auto;
+  color: #94a3b8;
+}
+.lau-diff-add  { background: rgba(74,222,128,0.15); color: #4ade80; border-radius: 2px; }
+.lau-diff-del  { background: rgba(248,113,113,0.12); color: #f87171; text-decoration: line-through; border-radius: 2px; }
+.lau-diff-same { color: #64748b; }
+
+/* Scan mode radios */
+#lau-mode-precise, #lau-mode-fast { cursor: pointer; }
+
+/* Lock button in memory */
+.lau-lock-btn:hover { opacity: 0.7; }
+
+/* History list */
+#lau-history-list { line-height: 1.5; }
