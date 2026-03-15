@@ -98,11 +98,12 @@ If nothing meaningful happened: {"operations": []}`;
   // STATE
   // ═══════════════════════════════════════════════════════════════════════════
 
-  let scanning     = false;
-  let previewData  = [];   // array of operation objects
-  let previewBooks = {};   // { name: bookData } — for popup book dropdown
-  let collapsed    = true;
-  let activityLog  = [];   // last 10 applied operations
+  let scanning          = false;
+  let previewData       = [];   // array of operation objects
+  let previewBooks      = {};   // { name: bookData } — for popup book dropdown
+  let lastBookOptHtml   = '';   // cached for "reopen" button
+  let collapsed         = true;
+  let activityLog       = [];   // last 10 applied operations
 
   // ═══════════════════════════════════════════════════════════════════════════
   // ST CONTEXT HELPERS
@@ -239,6 +240,10 @@ If nothing meaningful happened: {"operations": []}`;
   // PROMPT BUILDING
   // ═══════════════════════════════════════════════════════════════════════════
 
+  // Show up to this many chars of entry content in the prompt.
+  // Enough for AI to see full entries and extend them properly, not rewrite.
+  const ENTRY_PREVIEW_CHARS = 1000;
+
   function buildBookSummary(books) {
     const lines = [];
     for (const [name, data] of Object.entries(books)) {
@@ -249,10 +254,14 @@ If nothing meaningful happened: {"operations": []}`;
       if (meta.tags)        lines.push(`  Tags: ${meta.tags}`);
       for (const e of active) {
         const keys    = (e.key || []).slice(0, 5).join(', ') || '—';
-        const snippet = (e.content || '').slice(0, 150).replace(/\n/g, ' ').trim();
-        const dots    = (e.content?.length || 0) > 150 ? '…' : '';
+        const content = (e.content || '').trim();
+        const shown   = content.slice(0, ENTRY_PREVIEW_CHARS);
+        const clipped = content.length > ENTRY_PREVIEW_CHARS;
         lines.push(`  UID ${e.uid} | "${e.comment || '(no title)'}" | keys: [${keys}]`);
-        if (snippet) lines.push(`    → ${snippet}${dots}`);
+        if (shown) {
+          shown.split('\n').forEach(l => lines.push(`    ${l}`));
+          if (clipped) lines.push(`    …(content truncated)`);
+        }
       }
     }
     return lines.join('\n').trim() || '(no entries yet)';
@@ -280,6 +289,7 @@ Return your JSON operations array now.`;
     setScanBtn(false);
     setScanInfo('', '');
     resetStats();
+    showReopenBtn(false);
 
     try {
       const s = getSettings();
@@ -365,8 +375,10 @@ Return your JSON operations array now.`;
         return;
       }
 
-      previewData  = ops;
-      previewBooks = books;
+      previewData     = ops;
+      previewBooks    = books;
+      lastBookOptHtml = Object.keys(books)
+        .map(n => `<option value="${n}">${n}</option>`).join('');
 
       const counts = countByAction(ops);
       setStats({ books: bookCount, entries: totalEntries, msgs: msgs.length, suggested: ops.length });
@@ -376,6 +388,7 @@ Return your JSON operations array now.`;
         'ok'
       );
 
+      showReopenBtn(true);
       openPopup();
 
     } catch (err) {
@@ -431,65 +444,67 @@ Return your JSON operations array now.`;
     const defaultBook = s.selectedBooks[0] || '';
     const ops = [];
 
-    for (let i = 0; i < arr.length; i++) {
-      const raw = arr[i];
-      if (!raw || !VALID_ACTIONS.has(raw.action)) continue;
+    // uidBook is our ground truth — ALWAYS overrides AI's target_book for uid-based ops
+    const resolveBook = (uid) =>
+      (uid != null && uidBook[uid] != null) ? uidBook[uid] : (defaultBook);
 
-      let targetBook = raw.target_book || defaultBook;
+    for (let i = 0; i < arr.length; i++) {
+      const op = arr[i];
+      if (!op || !VALID_ACTIONS.has(op.action)) continue;
 
       const base = {
-        _id:        `lau_${Date.now()}_${i}`,
-        action:     raw.action,
-        reason:     String(raw.reason || ''),
-        targetBook,
-        applied:    false,
+        _id:     `lau_${Date.now()}_${i}`,
+        action:  op.action,
+        reason:  String(op.reason || ''),
+        applied: false,
       };
 
-      if (raw.action === 'create' || raw.action === 'summarize') {
-        if (!raw.comment?.trim() || !raw.content?.trim()) continue; // skip incomplete
+      if (op.action === 'create' || op.action === 'summarize') {
+        if (!op.comment?.trim() || !op.content?.trim()) continue;
         ops.push({
           ...base,
-          comment: String(raw.comment).slice(0, 200),
-          content: String(raw.content).slice(0, 5000),
-          keys:    Array.isArray(raw.keys) ? raw.keys.map(String).slice(0, 10) : [],
+          targetBook: op.target_book || defaultBook,
+          comment: String(op.comment).slice(0, 200),
+          content: String(op.content).slice(0, 5000),
+          keys:    Array.isArray(op.keys) ? op.keys.map(String).slice(0, 10) : [],
         });
 
-      } else if (raw.action === 'update') {
-        if (raw.uid == null) continue;
-        const uid = Number(raw.uid);
+      } else if (op.action === 'update') {
+        if (op.uid == null) continue;
+        const uid = Number(op.uid);
         if (!isFinite(uid)) continue;
-        // Auto-detect book from uid
-        if (!raw.target_book && uidBook[uid]) targetBook = uidBook[uid];
         ops.push({
           ...base,
           uid,
-          targetBook,
-          comment: raw.comment?.trim() ? String(raw.comment).slice(0, 200) : null,
-          content: raw.content?.trim() ? String(raw.content).slice(0, 5000) : null,
-          keys:    Array.isArray(raw.keys) ? raw.keys.map(String).slice(0, 10) : null,
+          targetBook: resolveBook(uid),   // always our map, not AI's guess
+          comment: op.comment?.trim() ? String(op.comment).slice(0, 200) : null,
+          content: op.content?.trim() ? String(op.content).slice(0, 5000) : null,
+          keys:    Array.isArray(op.keys) ? op.keys.map(String).slice(0, 10) : null,
         });
 
-      } else if (raw.action === 'merge') {
-        if (raw.keep_uid == null || raw.remove_uid == null) continue;
-        const keepUid   = Number(raw.keep_uid);
-        const removeUid = Number(raw.remove_uid);
+      } else if (op.action === 'merge') {
+        if (op.keep_uid == null || op.remove_uid == null) continue;
+        const keepUid   = Number(op.keep_uid);
+        const removeUid = Number(op.remove_uid);
         if (!isFinite(keepUid) || !isFinite(removeUid) || keepUid === removeUid) continue;
-        if (!raw.target_book && uidBook[keepUid]) targetBook = uidBook[keepUid];
         ops.push({
           ...base,
           keepUid,
           removeUid,
-          targetBook,
-          comment: raw.comment?.trim() ? String(raw.comment).slice(0, 200) : null,
-          content: raw.content?.trim() ? String(raw.content).slice(0, 5000) : null,
+          targetBook: resolveBook(keepUid),   // always our map
+          comment: op.comment?.trim() ? String(op.comment).slice(0, 200) : null,
+          content: op.content?.trim() ? String(op.content).slice(0, 5000) : null,
         });
 
-      } else if (raw.action === 'forget') {
-        if (raw.uid == null) continue;
-        const uid = Number(raw.uid);
+      } else if (op.action === 'forget') {
+        if (op.uid == null) continue;
+        const uid = Number(op.uid);
         if (!isFinite(uid)) continue;
-        if (!raw.target_book && uidBook[uid]) targetBook = uidBook[uid];
-        ops.push({ ...base, uid, targetBook });
+        ops.push({
+          ...base,
+          uid,
+          targetBook: resolveBook(uid),   // always our map
+        });
       }
     }
 
@@ -903,6 +918,21 @@ Return your JSON operations array now.`;
     $('#lau-scan-btn')
       .prop('disabled', !enabled)
       .text(enabled ? '🔍 Scan' : '⏳ Scanning…');
+  }
+
+  function showReopenBtn(show) {
+    if (show && previewData.length) {
+      if (!$('#lau-reopen-btn').length) {
+        const $btn = $('<button class="lau-btn lau-btn-reopen" id="lau-reopen-btn">📋 Reopen last scan</button>');
+        $btn.on('click', () => {
+          if (previewData.length && lastBookOptHtml) openPopup();
+        });
+        $('#lau-scan-btn').after($btn);
+      }
+      $('#lau-reopen-btn').show();
+    } else {
+      $('#lau-reopen-btn').hide();
+    }
   }
 
   function setScanInfo(msg, type) {
