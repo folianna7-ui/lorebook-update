@@ -91,6 +91,7 @@ If nothing meaningful happened: {"operations": []}`;
     selectedBooks:    [],
     messageScanCount: 20,
     prompt:           DEFAULT_PROMPT,
+    bookMeta:         {},   // { [bookName]: { description: '', tags: '' } }
   };
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -116,10 +117,26 @@ If nothing meaningful happened: {"operations": []}`;
     if (!Array.isArray(s.selectedBooks))  s.selectedBooks    = [];
     if (!(s.messageScanCount >= 1))       s.messageScanCount = 20;
     if (typeof s.prompt !== 'string')     s.prompt           = DEFAULT_PROMPT;
+    if (!s.bookMeta || typeof s.bookMeta !== 'object') s.bookMeta = {};
     return s;
   }
 
   function save() { ctx().saveSettingsDebounced(); }
+
+  // Get metadata for a book (description + tags). Always returns an object.
+  function getBookMeta(name) {
+    const s = getSettings();
+    if (!s.bookMeta[name]) s.bookMeta[name] = { description: '', tags: '' };
+    return s.bookMeta[name];
+  }
+
+  function setBookMeta(name, description, tags) {
+    const s = getSettings();
+    if (!s.bookMeta[name]) s.bookMeta[name] = {};
+    s.bookMeta[name].description = String(description || '').trim();
+    s.bookMeta[name].tags        = String(tags        || '').trim();
+    save();
+  }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // WORLD-INFO MODULE — dynamic import, cached after first load
@@ -226,7 +243,10 @@ If nothing meaningful happened: {"operations": []}`;
     const lines = [];
     for (const [name, data] of Object.entries(books)) {
       const active = Object.values(data?.entries || {}).filter(e => !e.disable);
+      const meta   = getBookMeta(name);
       lines.push(`\n[Lorebook: "${name}" — ${active.length} active entries]`);
+      if (meta.description) lines.push(`  Purpose: ${meta.description}`);
+      if (meta.tags)        lines.push(`  Tags: ${meta.tags}`);
       for (const e of active) {
         const keys    = (e.key || []).slice(0, 5).join(', ') || '—';
         const snippet = (e.content || '').slice(0, 150).replace(/\n/g, ' ').trim();
@@ -710,14 +730,23 @@ Return your JSON operations array now.`;
     }
 
     for (const name of names) {
-      const on  = s.selectedBooks.includes(name);
-      const $row = $(`<div class="lau-book-row${on ? ' lau-on' : ''}">
+      const on   = s.selectedBooks.includes(name);
+      const meta = getBookMeta(name);
+      const hasDesc = !!(meta.description || meta.tags);
+
+      const $wrap = $(`<div class="lau-book-wrap"></div>`);
+
+      // ── Main row ──────────────────────────────────────────────
+      const $row = $(`<div class="lau-book-row${on ? ' lau-on' : ''}${hasDesc ? ' lau-has-meta' : ''}">
         <span class="lau-ck">${on ? '☑' : '☐'}</span>
         <span class="lau-bname">${esc(name)}</span>
+        <button class="lau-meta-btn" title="Description &amp; tags for AI">✏️</button>
       </div>`);
-      // Store name directly on DOM node — avoids HTML encoding issues with data attributes
       $row[0]._lauName = name;
-      $row.on('click', function () {
+
+      // Toggle selection on row click (not on ✏️ button)
+      $row.on('click', function (e) {
+        if ($(e.target).hasClass('lau-meta-btn')) return; // handled separately
         const n  = this._lauName;
         const sl = getSettings().selectedBooks;
         const i  = sl.indexOf(n);
@@ -726,7 +755,63 @@ Return your JSON operations array now.`;
         save();
         updateSelCount();
       });
-      $list.append($row);
+
+      // ── Meta editor (hidden by default) ──────────────────────
+      const activeTags = meta.tags ? meta.tags.split(',').map(t => t.trim()).filter(Boolean) : [];
+      const $meta = $(`<div class="lau-meta-form" style="display:none">
+        <div class="lau-meta-field">
+          <label class="lau-meta-label">📝 Description for AI</label>
+          <input class="lau-meta-input lau-meta-desc" type="text"
+            placeholder="e.g. Gasil — demon character, personality and history"
+            value="${esc(meta.description)}" />
+        </div>
+        <div class="lau-meta-field">
+          <label class="lau-meta-label">🏷️ Category tags</label>
+          <div class="lau-tag-chips" id="lau-chips-${esc(name)}"></div>
+        </div>
+      </div>`);
+      $meta[0]._lauName = name;
+
+      // Render tag chips
+      const PRESET_TAGS = [
+        'main character', 'npc', 'faction', 'location',
+        'world', 'race', 'item', 'lore', 'event', 'summary', 'relationship',
+      ];
+      const $chips = $meta.find('.lau-tag-chips');
+      PRESET_TAGS.forEach(tag => {
+        const on = activeTags.includes(tag);
+        const $chip = $(`<span class="lau-chip${on ? ' lau-chip-on' : ''}">${esc(tag)}</span>`);
+        $chip[0]._lauTag = tag;
+        $chip.on('click', function () {
+          $(this).toggleClass('lau-chip-on');
+          _saveChipsAndDesc($meta, $row, name);
+        });
+        $chips.append($chip);
+      });
+
+      function _saveChipsAndDesc($m, $r, n) {
+        const tags = $m.find('.lau-chip-on').map(function () { return this._lauTag; }).get().join(',');
+        const desc = $m.find('.lau-meta-desc').val();
+        setBookMeta(n, desc, tags);
+        const hasMeta = !!(desc.trim() || tags.trim());
+        $r.toggleClass('lau-has-meta', hasMeta);
+      }
+
+      // Save description on input
+      $meta.on('input', '.lau-meta-desc', function () {
+        _saveChipsAndDesc($meta, $row, name);
+      });
+
+      // Toggle meta form on ✏️ click
+      $row.find('.lau-meta-btn').on('click', function (e) {
+        e.stopPropagation();
+        const isOpen = $meta.is(':visible');
+        $meta.slideToggle(140);
+        $(this).text(isOpen ? '✏️' : '✕');
+      });
+
+      $wrap.append($row).append($meta);
+      $list.append($wrap);
     }
 
     updateSelCount();
