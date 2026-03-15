@@ -1,1225 +1,1161 @@
 /**
  * Lorebook Auto-Updater v2.0
- * SillyTavern Extension — IIFE, no ES imports
+ * SillyTavern Extension — IIFE (no top-level ES imports)
  *
- * Features:
- *  - Lorebook role tags + descriptions (World / NPC / Main Characters / Race Lore / Memories / Custom)
- *  - Per-book AI scan (Precise mode) or one-shot (Fast mode)
- *  - Diff view on update cards (green = added, red = removed)
- *  - Confidence score from AI (high / medium / low)
- *  - Entry lock flag (🔒) — locked entries never suggested for update
- *  - Scan history (last 10 scans, stored in localStorage)
+ * Uses ST's native world-info.js via dynamic import():
+ *   loadWorldInfo(name)              — loads book from disk, always fresh
+ *   createWorldInfoEntry(name, data) — creates entry in data, returns it
+ *   saveWorldInfo(name, data, true)  — persists to disk immediately
  */
 
 (() => {
   'use strict';
 
-  const EXT_KEY      = 'lau_lorebook_updater';
-  const HISTORY_KEY  = 'lau_scan_history';
-  const MAX_HISTORY  = 10;
+  const EXT_KEY = 'lau_lorebook_updater';
 
-  // ─── Book role tags ───────────────────────────────────────────────────────
-  const BOOK_TAGS = {
-    world:    { emoji: '🌍', label: 'World',            hint: 'Geography, magic rules, history, organizations, locations. DO NOT place character entries here.' },
-    npc:      { emoji: '👤', label: 'NPC',              hint: 'Secondary / supporting characters only. NOT main heroes.' },
-    main:     { emoji: '⭐', label: 'Main Characters',  hint: 'Main protagonists, their development, relationships, inner states.' },
-    race:     { emoji: '🔥', label: 'Race / Lore',      hint: 'Race biology, culture, history, politics for a specific race.' },
-    memories: { emoji: '💭', label: 'Memories',         hint: 'Key scenes and memories. Create new entries, rarely update old ones.' },
-    custom:   { emoji: '📝', label: 'Custom',           hint: 'Custom category — see the description field below.' },
-  };
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DEFAULTS
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  // ─── Default prompt (used per-book, with role injected automatically) ─────
-  const BASE_PROMPT = `You are a lorebook assistant for a roleplay session.
+  const DEFAULT_PROMPT =
+`You are a lorebook maintenance assistant for a roleplay session.
 
-You are processing ONE lorebook called "{BOOK_NAME}" with role: {BOOK_ROLE_LABEL}.
-{BOOK_ROLE_HINT}
-{BOOK_DESCRIPTION}
+Review the recent chat and the existing lorebook entries shown below.
+Decide what should be created, updated, merged, forgotten, or summarized.
 
-Analyze the RECENT CHAT below and the existing entries of THIS lorebook only.
-Find entities relevant to this lorebook's role that either:
-  a) Are NEW and not yet in this lorebook — suggest "create"
-  b) Already exist AND have genuinely new information in the chat — suggest "update"
-  c) Nothing meaningful is new — return empty entries array
+AVAILABLE ACTIONS:
+  create    — A new entity/fact not yet in the lorebook
+  update    — An existing entry needs new information (provide COMPLETE content)
+  merge     — Two entries cover the same topic; consolidate them
+  forget    — An entry is outdated, disproven, or permanently irrelevant
+  summarize — Chronicle a significant scene or event that just happened
 
-═══ CONTENT & LANGUAGE ═══
-- Entry "content" MUST be in ENGLISH only.
-- Entry "comment" (title) MUST be in ENGLISH only.
-- NEVER place entries that belong to a different lorebook role (e.g. don't put character info in a World lorebook).
+CRITICAL RULES:
+1. Read every existing entry's snippet before deciding.
+2. If the fact is already covered → use "update", never "create".
+3. If two entries cover the same topic → use "merge".
+4. Prefer FEWER, BROADER entries. One scan rarely needs more than 2–3 operations.
+5. Skip minor dialogue, greetings, and restating known facts.
+6. For "update": your content REPLACES the entire entry — include ALL existing
+   valid facts PLUS the new information. Never drop existing facts.
 
-═══ PARAGRAPH / NEWLINE PRESERVATION ═══
-Existing entries are shown with newlines encoded as [NL].
-In your "content" field you MUST use [NL] wherever a newline belongs.
-Example: "[LOCATION: City][NL][NL][District 1]: Cold alleys.[NL][District 2]: Warm harbor."
-For UPDATE entries: copy the FULL_CONTENT exactly (with [NL]) and only INSERT new information.
-
-═══ KEYWORDS — NEW ENTRIES ONLY (RUSSIAN DECLENSION CLUSTERS) ═══
-For UPDATE entries: omit "keys" entirely — original keywords are preserved automatically.
-For CREATE entries: generate 10–20 Russian keywords.
-
-STRICT FORMAT — each keyword = ONE string with ALL 6 grammatical forms:
-  "nom, gen, dat, acc, inst, prep"
-  ✓ "башня, башни, башне, башню, башней, о башне"
-  ✓ "кабинет директора, кабинета директора, кабинету директора, кабинет директора, кабинетом директора, о кабинете директора"
-  ✗ "башня, кабинет" — WRONG, mixes two concepts into one string
-
-Keywords MUST be concrete: locations, objects, proper nouns, unique actions, named magic, physical items.
-Keywords MUST NOT be abstract: близость, доверие, власть, динамика, тоска.
-Keywords MUST NOT be names of the two main RP characters.
-
-═══ CRITICAL RULE FOR UPDATES ═══
-Before proposing any update, verify:
-  "Is this entry's topic EXPLICITLY mentioned in the recent chat messages?"
-  If NO — omit it entirely from your response.
-
-For "update" content:
-1. COPY the FULL_CONTENT from ENTRY_START uid:N … ENTRY_END uid:N EXACTLY.
-   Use ONLY that uid's content — NEVER mix content from different entries.
-2. APPEND / INTEGRATE new facts from chat only.
-3. NEVER delete or shorten existing text. Result must be longer or equal.
-4. PRESERVE formatting style: [Section]: headers, bullet points, markdown.
-5. Keep all [NL] tokens from original. Add [NL][NL] before new sections.
-
-ANTI-HALLUCINATION:
-— Each uid refers to exactly ONE entry. Content for uid:42 must come from ENTRY_START uid:42.
-— CRITICAL ERROR: mixing content from different uids, or inventing facts not in the chat.
-— If no new info for an entry — omit it entirely.
-
-═══ ORDER / DEPTH / POSITION FOR NEW ENTRIES ═══
-Analyze existing entries (each shows order/depth/position). Assign values matching the semantic category.
-Defaults if unsure: order:500, depth:4, position:0.
-
-═══ CONFIDENCE ═══
-For each entry include a "confidence" field:
-  "high"   — clear, explicit evidence in recent chat
-  "medium" — implied or indirect evidence
-  "low"    — weak inference, not directly stated
-
-Respond ONLY with this exact JSON (no markdown, no extra text):
+Respond ONLY with this JSON (no markdown, no extra text):
 {
-  "entries": [
+  "operations": [
     {
       "action": "create",
-      "comment": "Entry title in English",
-      "content": "Full text in English.[NL][NL][Section]: detail.",
-      "keys": [
-        "башня, башни, башне, башню, башней, о башне",
-        "шпиль, шпиля, шпилю, шпиль, шпилём, о шпиле"
-      ],
-      "order": 500,
-      "depth": 4,
-      "position": 0,
-      "confidence": "high",
-      "reason": "Why this entry is being created"
+      "comment": "Entry Title",
+      "content": "Full entry text, third person, present tense.",
+      "keys": ["keyword1", "keyword2"],
+      "target_book": "ExactBookName",
+      "reason": "Why this is new"
     },
     {
       "action": "update",
       "uid": 42,
-      "content": "Copy FULL_CONTENT from ENTRY_START uid:42 here.[NL][NL][New Section]: new fact.",
-      "confidence": "medium",
-      "reason": "What new info was added and which messages mention this entry's topic"
+      "target_book": "ExactBookName",
+      "comment": "Title (can be unchanged)",
+      "content": "COMPLETE content: all old facts + new ones.",
+      "keys": ["keyword1"],
+      "reason": "What changed"
+    },
+    {
+      "action": "merge",
+      "keep_uid": 42,
+      "remove_uid": 57,
+      "target_book": "ExactBookName",
+      "comment": "Merged title",
+      "content": "Combined content from both entries.",
+      "reason": "Why these should be one entry"
+    },
+    {
+      "action": "forget",
+      "uid": 33,
+      "target_book": "ExactBookName",
+      "reason": "Why this is outdated or wrong"
+    },
+    {
+      "action": "summarize",
+      "comment": "Scene: Descriptive Title",
+      "content": "What happened, past tense, who was involved, what changed.",
+      "keys": ["scene"],
+      "target_book": "ExactBookName",
+      "reason": "Why this scene matters"
     }
   ]
 }
 
-Rules:
-- Content and titles in ENGLISH only.
-- For "create": include "keys" with Russian declension clusters.
-- For "update": omit "keys" and "comment" — taken from existing entry automatically.
-- For "update": MUST include uid.
-- Never duplicate entries unless genuinely updating.
-- If unsure — skip. Only suggest when evidence is in the chat.`;
+If nothing meaningful happened: {"operations": []}`;
 
   const DEFAULTS = {
     selectedBooks:    [],
     messageScanCount: 20,
-    autoEnabled:      false,
-    autoInterval:     5,
-    scanMode:         'precise', // 'precise' | 'fast'
-    bookMeta:         {},        // { [bookName]: { tag, description, lockedUids } }
-    prompt:           BASE_PROMPT,
+    prompt:           DEFAULT_PROMPT,
   };
 
-  let scanning    = false;
-  let autoCounter = 0;
-  let previewData = [];
-  let snapBooks   = {};
-  let collapsed   = true;
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STATE
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  // ─── Helpers ──────────────────────────────────────────────────────────────
+  let scanning     = false;
+  let previewData  = [];   // array of operation objects
+  let previewBooks = {};   // { name: bookData } — for popup book dropdown
+  let collapsed    = true;
+  let activityLog  = [];   // last 10 applied operations
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ST CONTEXT HELPERS
+  // ═══════════════════════════════════════════════════════════════════════════
 
   function ctx() { return SillyTavern.getContext(); }
 
-  function getHeaders() {
-    try { const c=ctx(); if(typeof c.getRequestHeaders==='function') return c.getRequestHeaders(); } catch{}
-    if(typeof window.getRequestHeaders==='function'){try{return window.getRequestHeaders();}catch{}}
-    const m=document.querySelector('meta[name="csrf-token"]')?.content;
-    if(m) return {'Content-Type':'application/json','X-CSRF-Token':m};
-    const ck=document.cookie.match(/(?:^|;\s*)_csrf=([^;]*)/);
-    if(ck) return {'Content-Type':'application/json','X-CSRF-Token':decodeURIComponent(ck[1])};
-    console.warn('[LAU] No CSRF token found');
-    return {'Content-Type':'application/json'};
-  }
-
   function getSettings() {
-    const ext=ctx().extensionSettings;
-    if(!ext[EXT_KEY]) ext[EXT_KEY]={...DEFAULTS,selectedBooks:[],bookMeta:{}};
-    const s=ext[EXT_KEY];
-    Object.entries(DEFAULTS).forEach(([k,v])=>{if(s[k]===undefined) s[k]=typeof v==='object'&&!Array.isArray(v)?{...v}:v;});
-    if(!s.bookMeta) s.bookMeta={};
+    const ext = ctx().extensionSettings;
+    if (!ext[EXT_KEY]) ext[EXT_KEY] = { ...DEFAULTS, selectedBooks: [] };
+    const s = ext[EXT_KEY];
+    if (!Array.isArray(s.selectedBooks))  s.selectedBooks    = [];
+    if (!(s.messageScanCount >= 1))       s.messageScanCount = 20;
+    if (typeof s.prompt !== 'string')     s.prompt           = DEFAULT_PROMPT;
     return s;
   }
 
   function save() { ctx().saveSettingsDebounced(); }
 
-  function getBookMeta(name) {
-    const s=getSettings();
-    if(!s.bookMeta[name]) s.bookMeta[name]={tag:'world',description:'',lockedUids:[]};
-    return s.bookMeta[name];
-  }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // WORLD-INFO MODULE — dynamic import, cached after first load
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  function isLocked(bookName, uid) {
-    return (getBookMeta(bookName).lockedUids||[]).includes(uid);
-  }
+  let _wi = null;
 
-  function toggleLock(bookName, uid) {
-    const m=getBookMeta(bookName);
-    const arr=m.lockedUids||[];
-    const i=arr.indexOf(uid);
-    if(i===-1) arr.push(uid); else arr.splice(i,1);
-    m.lockedUids=arr;
-    save();
-    return arr.includes(uid);
-  }
-
-  // ─── World Info ───────────────────────────────────────────────────────────
-
-  async function serverGetNames() {
-    try {
-      const r=await fetch('/api/worldinfo/all',{method:'POST',headers:getHeaders(),body:'{}'});
-      if(r.ok){const d=await r.json();const a=Array.isArray(d)?d:(d?.entries||d?.names||d?.worlds);if(Array.isArray(a)&&a.length&&typeof a[0]==='string'){console.log('[LAU] Names via /api/worldinfo/all:',a.length);return a;}}
-    }catch(e){console.warn('[LAU] /api/worldinfo/all:',e.message);}
-    try {
-      const r=await fetch('/getsettings',{method:'POST',headers:getHeaders(),body:'{}'});
-      if(r.ok){const d=await r.json();if(Array.isArray(d?.world_names)&&d.world_names.length){console.log('[LAU] Names via /getsettings:',d.world_names.length);return d.world_names;}}
-    }catch(e){console.warn('[LAU] /getsettings:',e.message);}
-    for(const p of['../../../../world-info.js','../../../world-info.js','/scripts/world-info.js']){
-      try{const m=await import(p);if(Array.isArray(m?.world_names)&&m.world_names.length){return[...m.world_names];}}catch{}
+  async function getWI() {
+    if (_wi) return _wi;
+    // /scripts/world-info.js is an absolute path that always resolves correctly
+    // from classic scripts (unlike relative paths which resolve from document URL)
+    _wi = await import('/scripts/world-info.js');
+    if (typeof _wi.loadWorldInfo !== 'function') {
+      _wi = null;
+      throw new Error('loadWorldInfo not found in world-info.js. Is ST up to date?');
     }
-    try{
-      const c=ctx();
-      if(Array.isArray(c.world_names)&&c.world_names.length) return c.world_names;
-      for(const k of['worldInfoData','worldInfo','world_info']){const o=c[k];if(o&&!Array.isArray(o)){const ks=Object.keys(o).filter(x=>typeof o[x]==='object');if(ks.length) return ks;}}
-    }catch{}
-    console.error('[LAU] Could not get book names!');
-    return[];
+    console.log('[LAU] world-info.js imported ✓');
+    return _wi;
   }
 
-  async function serverGetBook(name) {
-    try{const r=await fetch('/api/worldinfo/get',{method:'POST',headers:getHeaders(),body:JSON.stringify({name})});if(r.ok){const d=await r.json();if(d?.entries){return d;}}}catch(e){console.warn('[LAU] /api/worldinfo/get:',e.message);}
-    try{const r=await fetch('/getworldinfo',{method:'POST',headers:getHeaders(),body:JSON.stringify({name})});if(r.ok){const d=await r.json();if(d?.entries){return d;}}}catch(e){console.warn('[LAU] /getworldinfo:',e.message);}
-    for(const p of['../../../../world-info.js','../../../world-info.js','/scripts/world-info.js']){
-      try{const m=await import(p);if(m?.world_info?.[name]) return m.world_info[name];}catch{}
-    }
-    try{const c=ctx();for(const k of['worldInfoData','worldInfo','world_info']){if(c[k]?.[name]) return c[k][name];}}catch{}
-    console.error('[LAU] Could not load book:',name);
-    return null;
+  async function wiGetNames() {
+    const wi = await getWI();
+    return Array.isArray(wi.world_names) ? [...wi.world_names] : [];
   }
 
-  // ─── AI generation ────────────────────────────────────────────────────────
+  async function wiLoad(name) {
+    const wi = await getWI();
+    const data = await wi.loadWorldInfo(name);
+    return data; // { entries: { [key]: entry } }
+  }
+
+  async function wiSave(name, data) {
+    const wi = await getWI();
+    await wi.saveWorldInfo(name, data, /* immediately */ true);
+  }
+
+  // Must call getWI() first — _wi is guaranteed non-null here
+  function wiCreate(name, data) {
+    return _wi.createWorldInfoEntry(name, data);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // AI GENERATION
+  // ═══════════════════════════════════════════════════════════════════════════
 
   function extractText(d) {
-    if(d?.choices?.[0]?.message?.content!=null) return d.choices[0].message.content;
-    if(d?.choices?.[0]?.text!=null) return d.choices[0].text;
-    if(typeof d?.response==='string') return d.response;
-    if(Array.isArray(d?.content)){const t=d.content.find(b=>b.type==='text');return t?.text??null;}
-    if(typeof d?.content==='string') return d.content;
+    if (d?.choices?.[0]?.message?.content != null) return d.choices[0].message.content;
+    if (d?.choices?.[0]?.text            != null) return d.choices[0].text;
+    if (typeof d?.response === 'string')           return d.response;
+    if (Array.isArray(d?.content)) {
+      const t = d.content.find(b => b.type === 'text');
+      return t?.text ?? null;
+    }
+    if (typeof d?.content === 'string') return d.content;
     return null;
   }
 
   async function aiGenerate(fullPrompt) {
-    const c=ctx();
-    if(typeof c.generateRaw==='function'){try{const r=await c.generateRaw(fullPrompt,'',false,false,'','normal');if(r?.trim()) return r;}catch(e){console.warn('[LAU] generateRaw:',e.message);}}
-    if(typeof c.generateQuietPrompt==='function'){try{const r=await c.generateQuietPrompt(fullPrompt,false,false);if(r?.trim()) return r;}catch(e){console.warn('[LAU] generateQuietPrompt:',e.message);}}
-    for(const{url,body}of[
-      {url:'/api/backends/chat-completions/generate',body:{messages:[{role:'user',content:fullPrompt}],stream:false}},
-      {url:'/api/generate',body:{prompt:fullPrompt,max_new_tokens:2000,stream:false}},
-    ]){
-      try{const r=await fetch(url,{method:'POST',headers:getHeaders(),body:JSON.stringify(body)});if(!r.ok) continue;const t=extractText(await r.json());if(t?.trim()) return t;}catch{}
+    const c = ctx();
+
+    // 1. generateRaw — uses the active ST connection profile
+    if (typeof c.generateRaw === 'function') {
+      try {
+        const r = await c.generateRaw(fullPrompt, '', false, false, '', 'normal');
+        if (r?.trim()) return r.trim();
+      } catch (e) { console.warn('[LAU] generateRaw failed:', e.message); }
     }
+
+    // 2. generateQuietPrompt — older ST versions
+    if (typeof c.generateQuietPrompt === 'function') {
+      try {
+        const r = await c.generateQuietPrompt(fullPrompt, false, false);
+        if (r?.trim()) return r.trim();
+      } catch (e) { console.warn('[LAU] generateQuietPrompt failed:', e.message); }
+    }
+
+    // 3. ST proxy endpoints
+    for (const { url, body } of [
+      { url: '/api/backends/chat-completions/generate',
+        body: { messages: [{ role: 'user', content: fullPrompt }], stream: false } },
+      { url: '/api/generate',
+        body: { prompt: fullPrompt, max_new_tokens: 2000, stream: false } },
+    ]) {
+      try {
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) continue;
+        const t = extractText(await resp.json());
+        if (t?.trim()) return t.trim();
+      } catch { /* try next */ }
+    }
+
     throw new Error('No active AI connection. Set one up in SillyTavern first.');
   }
 
-  // ─── Prompt builder ───────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PROMPT BUILDING
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  function buildBookPrompt(bookName, bookData, msgs, meta, allBooks) {
-    const tag      = meta?.tag || 'world';
-    const tagInfo  = BOOK_TAGS[tag] || BOOK_TAGS.world;
-    const desc     = meta?.description?.trim();
-    const locked   = meta?.lockedUids || [];
-
-    let prompt = (getSettings().prompt || BASE_PROMPT)
-      .replace('{BOOK_NAME}',        bookName)
-      .replace('{BOOK_ROLE_LABEL}',  `${tagInfo.emoji} ${tagInfo.label}`)
-      .replace('{BOOK_ROLE_HINT}',   `Role guidance: ${tagInfo.hint}`)
-      .replace('{BOOK_DESCRIPTION}', desc ? `Additional context: "${desc}"` : '');
-
-    const entries = Object.values(bookData?.entries || {});
-    const lines = [`\n====== LOREBOOK: "${bookName}" [${tagInfo.emoji} ${tagInfo.label}] (${entries.length} entries) ======`];
-
-    entries.forEach(e => {
-      const lockMark = locked.includes(e.uid) ? ' 🔒 LOCKED — DO NOT SUGGEST UPDATES' : '';
-      lines.push(`\n>>>>> ENTRY_START uid:${e.uid} <<<<<`);
-      lines.push(`TITLE: ${e.comment||'(no title)'}${lockMark}`);
-      lines.push(`META: order:${e.order??'?'} depth:${e.depth??'?'} position:${e.position??'?'}`);
-      if((e.key||[]).length) lines.push(`EXISTING_KEYS (preserved on update, do NOT change): ${JSON.stringify(e.key)}`);
-      if(e.content){
-        const encoded=e.content.replace(/\r\n/g,'[NL]').replace(/\n/g,'[NL]');
-        lines.push(`FULL_CONTENT (newlines=[NL]):`);
-        lines.push(encoded);
-      }
-      lines.push(`<<<<< ENTRY_END uid:${e.uid} >>>>>`);
-    });
-
-    // Cross-book index: tell AI about entries in OTHER books so it won't recreate them
-    let crossBookSection = '';
-    if (allBooks && Object.keys(allBooks).length > 1) {
-      const otherEntries = [];
-      Object.entries(allBooks).forEach(([oBook, oData]) => {
-        if (oBook === bookName) return;
-        Object.values(oData?.entries || {}).forEach(oe => {
-          if (oe.comment) otherEntries.push(`  - "${oe.comment}" (uid:${oe.uid} in "${oBook}")`);
-        });
-      });
-      if (otherEntries.length) {
-        crossBookSection = `=== ENTRIES THAT ALREADY EXIST IN OTHER LOREBOOKS (do NOT recreate) ===\n${otherEntries.join('\n')}`;
+  function buildBookSummary(books) {
+    const lines = [];
+    for (const [name, data] of Object.entries(books)) {
+      const active = Object.values(data?.entries || {}).filter(e => !e.disable);
+      lines.push(`\n[Lorebook: "${name}" — ${active.length} active entries]`);
+      for (const e of active) {
+        const keys    = (e.key || []).slice(0, 5).join(', ') || '—';
+        const snippet = (e.content || '').slice(0, 150).replace(/\n/g, ' ').trim();
+        const dots    = (e.content?.length || 0) > 150 ? '…' : '';
+        lines.push(`  UID ${e.uid} | "${e.comment || '(no title)'}" | keys: [${keys}]`);
+        if (snippet) lines.push(`    → ${snippet}${dots}`);
       }
     }
+    return lines.join('\n').trim() || '(no entries yet)';
+  }
 
-    return `${prompt}
+  function buildFullPrompt(customPrompt, bookSummary, msgs, count) {
+    return `${customPrompt}
 
-${lines.join('\n')}
+=== EXISTING LOREBOOK ENTRIES ===
+${bookSummary}
 
-${crossBookSection ? crossBookSection + '\n\n' : ''}=== RECENT CHAT (last ${msgs.length} messages) ===
+=== RECENT CHAT (last ${count} messages) ===
 ${msgs.join('\n\n')}
 
-Based on the chat above, suggest lorebook actions for "${bookName}". Respond with JSON only.`;
+Return your JSON operations array now.`;
   }
 
-  // ─── Validation + parse ───────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SCAN
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  function buildUidMaps(books) {
-    const uidBook={};
-    const uidEntry={};
-    Object.entries(books).forEach(([name,data])=>{
-      Object.values(data?.entries||{}).forEach(ex=>{uidBook[ex.uid]=name;uidEntry[ex.uid]=ex;});
-    });
-    return{uidBook,uidEntry};
-  }
+  async function runScan() {
+    if (scanning) return;
+    scanning = true;
+    setScanBtn(false);
+    setScanInfo('', '');
+    resetStats();
 
-  function validateUpdates(arr, uidEntry, bookName) {
-    return arr.filter(e=>{
-      if(e.action!=='update') return true;
-      const uid=e.uid;
-      const existing=uid!=null?uidEntry[uid]:null;
-      if(!existing){console.warn(`[LAU] Dropped update: uid ${uid} not found.`);return false;}
-      // If bookName provided, ensure uid belongs to this book
-      if(bookName){const entries=Object.values(snapBooks[bookName]?.entries||{});const belongs=entries.some(x=>x.uid===uid);if(!belongs){console.warn(`[LAU] Dropped update uid ${uid}: not in book "${bookName}"`);return false;}}
-      const rawContent=(e.content||'').replace(/\[NL\]/g,'\n').trim();
-      if(!rawContent){console.warn(`[LAU] Dropped update uid ${uid}: empty content.`);return false;}
-      const origLen=(existing.content||'').trim().length;
-      if(origLen>100&&rawContent.length<origLen*0.8){console.warn(`[LAU] Dropped update uid ${uid}: content shrank (${origLen}→${rawContent.length}).`);return false;}
-      const origStart=(existing.content||'').trim().slice(0,60).toLowerCase();
-      if(origStart.length>20&&!rawContent.toLowerCase().includes(origStart)){console.warn(`[LAU] Dropped update uid ${uid}: opening of original not found in new content.`);return false;}
-      return true;
-    });
-  }
+    try {
+      const s = getSettings();
 
-  function parseRaw(raw) {
-    let text=raw.trim().replace(/^```(?:json)?\s*/i,'').replace(/\s*```\s*$/i,'');
-    try{return JSON.parse(text);}catch{}
-    const m=text.match(/\{[\s\S]*\}/);
-    if(!m) throw new Error('AI did not return valid JSON. Got: '+text.slice(0,300));
-    return JSON.parse(m[0]);
-  }
+      // Guard: need at least one book selected
+      if (!s.selectedBooks.length) {
+        setScanInfo('⚠️ No lorebooks selected — tap them in the list.', 'warn');
+        return;
+      }
 
-  function parseResponse(raw, books, bookName) {
-    const parsed=parseRaw(raw);
-    const arr=parsed.entries||parsed;
-    if(!Array.isArray(arr)) throw new Error('AI response has no "entries" array.');
-    const{uidBook,uidEntry}=buildUidMaps(books);
-    const s=getSettings();
-    const validated=validateUpdates(arr, uidEntry, bookName||null);
+      // ── Step 1: Load lorebooks from disk ──────────────────────────────────
+      setScanInfo('📂 Loading lorebooks…', 'info');
 
-    return validated.map((e,i)=>{
-      const existing=(e.action==='update'&&e.uid!=null)?(uidEntry[e.uid]||null):null;
+      const books  = {};
+      const failed = [];
 
-      // Decode [NL] tokens; also strip any [NL= prefix artifact from a malformed prompt
-      let decodedContent=(e.content||'').replace(/^\[NL=/,'').replace(/\[NL\]/g,'\n');
-
-      // Safety: recover collapsed paragraph structure
-      if(existing&&e.action==='update'&&decodedContent){
-        const origNL=(existing.content||'').split('\n').length-1;
-        const newNL=decodedContent.split('\n').length-1;
-        if(origNL>=3&&newNL===0){
-          decodedContent=decodedContent.replace(/\s*(\[[^\]]+\]:?)/g,'\n\n$1').replace(/^\n+/,'');
-          console.warn('[LAU] Recovered paragraph structure for uid',e.uid);
+      for (const name of s.selectedBooks) {
+        try {
+          const data = await wiLoad(name);
+          if (data?.entries) {
+            books[name] = data;
+            console.log(`[LAU] Loaded "${name}" — ${Object.keys(data.entries).length} entries`);
+          } else {
+            failed.push(name);
+            console.warn('[LAU] No entries in:', name);
+          }
+        } catch (e) {
+          failed.push(name);
+          console.warn('[LAU] Could not load:', name, e.message);
         }
       }
 
-      // For updates: always preserve original comment + keys from existing entry
-      const useComment=existing?(existing.comment||e.comment||`Entry ${i+1}`):(e.comment||`Entry ${i+1}`).replace(/\[NL\]/g,' ');
-      const useKeys=existing?(existing.key||[]):(Array.isArray(e.keys)?e.keys:[]);
-      const useSecondaryKeys=existing?(existing.secondary_key||[]):[];
+      const bookCount    = Object.keys(books).length;
+      const totalEntries = Object.values(books)
+        .reduce((n, b) => n + Object.values(b.entries).filter(e => !e.disable).length, 0);
 
-      return {
-        _id:`lau_${Date.now()}_${i}`,
-        action:e.action||'create', uid:e.uid??null,
-        comment:useComment, content:decodedContent,
-        originalContent: existing?existing.content:null,
-        keys:useKeys, secondary_keys:useSecondaryKeys,
-        order:   existing?(existing.order??100)  :(e.order??500),
-        depth:   existing?(existing.depth??4)    :(e.depth??4),
-        position:existing?(existing.position??0) :(e.position??0),
-        confidence: e.confidence||'medium',
-        _existingMeta: existing?{
-          constant:existing.constant, selective:existing.selective,
-          addMemo:existing.addMemo, disable:existing.disable,
-          role:existing.role, strategy:existing.strategy,
-          secondary_key:existing.secondary_key,
-        }:null,
-        reason:e.reason||'',
-        targetBook: bookName||(e.uid!=null&&uidBook[e.uid])?
-          (bookName||uidBook[e.uid]):(s.selectedBooks[0]||''),
-        applied:false,
-      };
-    });
-  }
-
-  // ─── Diff ─────────────────────────────────────────────────────────────────
-
-  function computeDiff(original, updated) {
-    if(!original) return `<span class="lau-diff-add">${esc(updated)}</span>`;
-    if(original === updated) return `<span class="lau-diff-same">${esc(updated)}</span>`;
-
-    const origLines = original.split('\n');
-    const newLines  = updated.split('\n');
-
-    // Find longest common prefix (line-by-line)
-    let pi = 0;
-    while(pi < origLines.length && pi < newLines.length && origLines[pi] === newLines[pi]) pi++;
-
-    // Find longest common suffix (not overlapping the prefix)
-    let si = 0;
-    const maxSi = Math.min(origLines.length - pi, newLines.length - pi);
-    while(si < maxSi && origLines[origLines.length-1-si] === newLines[newLines.length-1-si]) si++;
-
-    const commonPrefixLines = origLines.slice(0, pi);
-    const commonSuffixLines = si > 0 ? origLines.slice(origLines.length - si) : [];
-    const removedMid        = origLines.slice(pi, si > 0 ? origLines.length - si : origLines.length);
-    const addedMid          = newLines.slice(pi, si > 0 ? newLines.length - si : newLines.length);
-
-    const parts = [];
-
-    // Common prefix — shown dimmed
-    if(commonPrefixLines.length) {
-      // Only show last 3 lines of prefix to save space
-      const shown = commonPrefixLines.slice(-3);
-      if(commonPrefixLines.length > 3) parts.push('<span class="lau-diff-same" style="color:#334155">… (unchanged) …\n</span>');
-      parts.push(`<span class="lau-diff-same">${esc(shown.join('\n'))}\n</span>`);
-    }
-
-    // Removed lines (only show if the content genuinely shrank — shouldn't happen but show for safety)
-    if(removedMid.length && addedMid.length === 0) {
-      parts.push(`<span class="lau-diff-del">${esc(removedMid.join('\n'))}</span>`);
-    }
-
-    // Added/changed lines — the interesting part
-    if(addedMid.length) {
-      if(removedMid.length > 0) {
-        // Lines were changed: show word-level diff
-        const wordD = wordLevelDiff(removedMid.join('\n'), addedMid.join('\n'));
-        parts.push(wordD);
-      } else {
-        // Pure additions: highlight everything green
-        parts.push(`<span class="lau-diff-add">${esc(addedMid.join('\n'))}</span>`);
-      }
-    }
-
-    // Common suffix — shown dimmed (first 2 lines only)
-    if(commonSuffixLines.length) {
-      const shown = commonSuffixLines.slice(0, 2);
-      parts.push(`\n<span class="lau-diff-same">${esc(shown.join('\n'))}${commonSuffixLines.length > 2 ? '\n… (unchanged)' : ''}</span>`);
-    }
-
-    // If nothing changed visually (edge case), show the whole new content
-    if(!parts.length) return `<span class="lau-diff-same">${esc(updated)}</span>`;
-
-    return parts.join('');
-  }
-
-  function wordLevelDiff(oldText, newText) {
-    // Simple: highlight words in newText that aren't in oldText
-    const oldWords = new Set(oldText.split(/\s+/).filter(Boolean));
-    const newWords = newText.split(/(\s+)/);
-    return newWords.map(w => {
-      if(/^\s+$/.test(w)) return w;
-      if(!oldWords.has(w)) return `<span class="lau-diff-add">${esc(w)}</span>`;
-      return `<span class="lau-diff-same">${esc(w)}</span>`;
-    }).join('');
-  }
-
-  // ─── Scan history ─────────────────────────────────────────────────────────
-
-  function loadHistory() {
-    try{ return JSON.parse(localStorage.getItem(HISTORY_KEY)||'[]'); }catch{ return []; }
-  }
-
-  function saveHistory(scans) {
-    try{ localStorage.setItem(HISTORY_KEY, JSON.stringify(scans.slice(-MAX_HISTORY))); }catch{}
-  }
-
-  function pushHistory(entry) {
-    const h = loadHistory();
-    h.push(entry);
-    saveHistory(h);
-  }
-
-  // ─── Core scan ────────────────────────────────────────────────────────────
-
-  async function runScan() {
-    if(scanning) return;
-    scanning=true;
-    setScanBtn(false);
-    resetStats();
-    setScanInfo('','');
-
-    try {
-      const s=getSettings();
-      if(!s.selectedBooks.length){ setScanInfo('⚠️ No lorebooks selected.','warn'); return; }
-
-      setScanInfo('📂 Loading lorebooks…','info');
-      const books={};
-      const failed=[];
-      for(const name of s.selectedBooks){
-        const data=await serverGetBook(name);
-        if(data) books[name]=data;
-        else failed.push(name);
-      }
-      const bookCount=Object.keys(books).length;
-      const totalEntries=Object.values(books).reduce((n,b)=>n+Object.keys(b.entries||{}).length,0);
-      if(!bookCount){ setScanInfo('❌ Could not load lorebooks.','err'); return; }
-      if(failed.length) setScanInfo(`⚠️ Loaded ${bookCount} book(s). Failed: ${failed.join(', ')}`,'warn');
-
-      const c=ctx();
-      const chat=c.chat||[];
-      const count=Math.max(1,s.messageScanCount);
-      const msgs=chat.slice(-count).filter(m=>m&&m.mes&&!m.is_system)
-        .map(m=>`${m.is_user?(c.name1||'User'):(m.name||c.name2||'AI')}: ${m.mes}`);
-      if(!msgs.length){ setScanInfo('⚠️ No chat messages found.','warn'); return; }
-
-      setStats({books:bookCount,entries:totalEntries,msgs:msgs.length,suggested:null});
-
-      let entries=[];
-      if(s.scanMode==='precise'){
-        entries=await runScanPrecise(books,msgs,bookCount);
-      } else {
-        entries=await runScanFast(books,msgs);
+      if (!bookCount) {
+        setScanInfo('❌ Could not load any lorebook. See console (F12).', 'err');
+        return;
       }
 
-      if(!entries.length){ setScanInfo('ℹ️ Nothing new to add or update.','info'); return; }
+      if (failed.length) {
+        setScanInfo(`⚠️ Loaded ${bookCount}. Could not load: ${failed.join(', ')}`, 'warn');
+      }
 
-      previewData=entries;
-      snapBooks=books;
-      renderMemoryPanel();
+      // ── Step 2: Get chat messages ─────────────────────────────────────────
+      const c     = ctx();
+      const chat  = c.chat || [];
+      const count = Math.max(1, s.messageScanCount);
 
-      const cn=entries.filter(e=>e.action==='create').length;
-      const un=entries.filter(e=>e.action==='update').length;
-      const low=entries.filter(e=>e.confidence==='low').length;
+      const msgs = chat
+        .slice(-count)
+        .filter(m => m?.mes && !m.is_system)
+        .map(m => {
+          const role = m.is_user ? (c.name1 || 'User') : (m.name || c.name2 || 'AI');
+          return `${role}: ${m.mes}`;
+        });
 
-      setStats({books:bookCount,entries:totalEntries,msgs:msgs.length,suggested:entries.length});
-      setScanInfo(`✅ ${cn} new · ${un} updated${low?` · ⚠️ ${low} low-confidence`:''}`,  'ok');
-      updateReopenBtn();
+      if (!msgs.length) {
+        setScanInfo('⚠️ No chat messages to scan yet.', 'warn');
+        return;
+      }
+
+      setStats({ books: bookCount, entries: totalEntries, msgs: msgs.length, suggested: null });
+      setScanInfo(`🤖 Asking AI… (${totalEntries} entries · ${msgs.length} msgs)`, 'info');
+
+      // ── Step 3: Build prompt & call AI ────────────────────────────────────
+      const summary    = buildBookSummary(books);
+      const fullPrompt = buildFullPrompt(s.prompt, summary, msgs, count);
+      const raw        = await aiGenerate(fullPrompt);
+
+      if (!raw) {
+        setScanInfo('⚠️ AI returned empty response.', 'warn');
+        return;
+      }
+
+      // ── Step 4: Parse response ────────────────────────────────────────────
+      const ops = parseResponse(raw, books, s);
+
+      if (!ops.length) {
+        setScanInfo('ℹ️ AI found nothing to add or update.', 'info');
+        setStats({ books: bookCount, entries: totalEntries, msgs: msgs.length, suggested: 0 });
+        return;
+      }
+
+      previewData  = ops;
+      previewBooks = books;
+
+      const counts = countByAction(ops);
+      setStats({ books: bookCount, entries: totalEntries, msgs: msgs.length, suggested: ops.length });
+      setScanInfo(
+        `✅ ${counts.create} new · ${counts.update} updated · ${counts.merge} merged · ` +
+        `${counts.forget} forgotten · ${counts.summarize} summarized`,
+        'ok'
+      );
+
       openPopup();
 
-      pushHistory({
-        date:new Date().toISOString(),
-        books:Object.keys(books),
-        msgs:msgs.length,
-        created:cn, updated:un,
-        applied:0,
-      });
-
-    } catch(err) {
-      setScanInfo('❌ '+err.message,'err');
-      console.error('[LAU]',err);
+    } catch (err) {
+      setScanInfo('❌ ' + err.message, 'err');
+      console.error('[LAU] Scan error:', err);
     } finally {
-      scanning=false;
+      scanning = false;
       setScanBtn(true);
     }
   }
 
-  async function runScanPrecise(books, msgs, bookCount) {
-    const s=getSettings();
-    const all=[];
-    let i=0;
-    for(const[bookName,bookData]of Object.entries(books)){
-      i++;
-      setScanInfo(`🤖 Scanning book ${i}/${bookCount}: "${bookName}"…`,'info');
-      const meta=getBookMeta(bookName);
-      const prompt=buildBookPrompt(bookName,bookData,msgs,meta,books);
-      try{
-        const raw=await aiGenerate(prompt);
-        if(!raw?.trim()) continue;
-        const entries=parseResponse(raw,books,bookName);
-        all.push(...entries);
-      }catch(err){
-        console.error(`[LAU] Book "${bookName}" scan failed:`,err);
-        setScanInfo(`⚠️ Book "${bookName}" failed: ${err.message}`,'warn');
+  function countByAction(ops) {
+    return ops.reduce((acc, op) => {
+      acc[op.action] = (acc[op.action] || 0) + 1;
+      return acc;
+    }, { create: 0, update: 0, merge: 0, forget: 0, summarize: 0 });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PARSE AI RESPONSE
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  const VALID_ACTIONS = new Set(['create', 'update', 'merge', 'forget', 'summarize']);
+
+  function parseResponse(raw, books, s) {
+    // Strip markdown fences if present
+    const text = raw.trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```\s*$/i, '');
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // Try to extract the first JSON object from the response
+      const m = text.match(/\{[\s\S]*\}/);
+      if (!m) throw new Error('AI returned invalid JSON. Got: ' + text.slice(0, 200));
+      try { parsed = JSON.parse(m[0]); }
+      catch { throw new Error('Could not parse AI response as JSON. Got: ' + text.slice(0, 200)); }
+    }
+
+    const arr = parsed.operations || parsed.entries || parsed;
+    if (!Array.isArray(arr)) throw new Error('AI response has no "operations" array.');
+
+    // Build uid → bookName map so we can auto-detect target book from uid
+    const uidBook = {};
+    for (const [name, data] of Object.entries(books)) {
+      for (const e of Object.values(data.entries || {})) {
+        uidBook[e.uid] = name;
       }
     }
-    return all;
-  }
 
-  async function runScanFast(books, msgs) {
-    const s=getSettings();
-    setScanInfo('🤖 Asking AI (fast mode)…','info');
+    const defaultBook = s.selectedBooks[0] || '';
+    const ops = [];
 
-    // Build a combined prompt for all books
-    const lines=[s.prompt||BASE_PROMPT];
-    for(const[bookName,bookData]of Object.entries(books)){
-      const meta=getBookMeta(bookName);
-      const tag=meta?.tag||'world';
-      const tagInfo=BOOK_TAGS[tag]||BOOK_TAGS.world;
-      const locked=meta?.lockedUids||[];
-      const entries=Object.values(bookData?.entries||{});
-      lines.push(`\n====== LOREBOOK: "${bookName}" [${tagInfo.emoji} ${tagInfo.label}] — ${tagInfo.hint} ======`);
-      entries.forEach(e=>{
-        const lockMark=locked.includes(e.uid)?' 🔒 LOCKED':'' ;
-        lines.push(`\n>>>>> ENTRY_START uid:${e.uid} <<<<<`);
-        lines.push(`TITLE: ${e.comment||'(no title)'}${lockMark}`);
-        lines.push(`META: order:${e.order??'?'} depth:${e.depth??'?'} position:${e.position??'?'}`);
-        if((e.key||[]).length) lines.push(`EXISTING_KEYS: ${JSON.stringify(e.key)}`);
-        if(e.content){const enc=e.content.replace(/\r\n/g,'[NL]').replace(/\n/g,'[NL]');lines.push('FULL_CONTENT (newlines=[NL]):');lines.push(enc);}
-        lines.push(`<<<<< ENTRY_END uid:${e.uid} >>>>>`);
-      });
+    for (let i = 0; i < arr.length; i++) {
+      const raw = arr[i];
+      if (!raw || !VALID_ACTIONS.has(raw.action)) continue;
+
+      let targetBook = raw.target_book || defaultBook;
+
+      const base = {
+        _id:        `lau_${Date.now()}_${i}`,
+        action:     raw.action,
+        reason:     String(raw.reason || ''),
+        targetBook,
+        applied:    false,
+      };
+
+      if (raw.action === 'create' || raw.action === 'summarize') {
+        if (!raw.comment?.trim() || !raw.content?.trim()) continue; // skip incomplete
+        ops.push({
+          ...base,
+          comment: String(raw.comment).slice(0, 200),
+          content: String(raw.content).slice(0, 5000),
+          keys:    Array.isArray(raw.keys) ? raw.keys.map(String).slice(0, 10) : [],
+        });
+
+      } else if (raw.action === 'update') {
+        if (raw.uid == null) continue;
+        const uid = Number(raw.uid);
+        if (!isFinite(uid)) continue;
+        // Auto-detect book from uid
+        if (!raw.target_book && uidBook[uid]) targetBook = uidBook[uid];
+        ops.push({
+          ...base,
+          uid,
+          targetBook,
+          comment: raw.comment?.trim() ? String(raw.comment).slice(0, 200) : null,
+          content: raw.content?.trim() ? String(raw.content).slice(0, 5000) : null,
+          keys:    Array.isArray(raw.keys) ? raw.keys.map(String).slice(0, 10) : null,
+        });
+
+      } else if (raw.action === 'merge') {
+        if (raw.keep_uid == null || raw.remove_uid == null) continue;
+        const keepUid   = Number(raw.keep_uid);
+        const removeUid = Number(raw.remove_uid);
+        if (!isFinite(keepUid) || !isFinite(removeUid) || keepUid === removeUid) continue;
+        if (!raw.target_book && uidBook[keepUid]) targetBook = uidBook[keepUid];
+        ops.push({
+          ...base,
+          keepUid,
+          removeUid,
+          targetBook,
+          comment: raw.comment?.trim() ? String(raw.comment).slice(0, 200) : null,
+          content: raw.content?.trim() ? String(raw.content).slice(0, 5000) : null,
+        });
+
+      } else if (raw.action === 'forget') {
+        if (raw.uid == null) continue;
+        const uid = Number(raw.uid);
+        if (!isFinite(uid)) continue;
+        if (!raw.target_book && uidBook[uid]) targetBook = uidBook[uid];
+        ops.push({ ...base, uid, targetBook });
+      }
     }
-    lines.push(`\n=== RECENT CHAT (last ${msgs.length} messages) ===`);
-    lines.push(msgs.join('\n\n'));
-    lines.push('\nSuggest lorebook actions. Respond with JSON only.');
 
-    const raw=await aiGenerate(lines.join('\n'));
-    if(!raw?.trim()) return[];
-    return parseResponse(raw,books,null);
+    return ops;
   }
 
-  // ─── Auto-scan ────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // APPLY OPERATIONS
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  function onMessage(){
-    const s=getSettings();
-    if(!s.autoEnabled) return;
-    autoCounter++;
-    if(autoCounter>=s.autoInterval){autoCounter=0;runScan();}
+  function findEntryByUid(entries, uid) {
+    for (const e of Object.values(entries)) {
+      if (e.uid === uid) return e;
+    }
+    return null;
   }
 
-  // ─── Mount UI ─────────────────────────────────────────────────────────────
+  async function applyOp(op) {
+    if (!op.targetBook) throw new Error('No target lorebook specified for this operation.');
+
+    // Always reload fresh from disk — avoids stale state between applies
+    const data = await wiLoad(op.targetBook);
+    if (!data?.entries) throw new Error(`Could not load lorebook "${op.targetBook}".`);
+
+    if (op.action === 'create' || op.action === 'summarize') {
+      // createWorldInfoEntry adds entry to data.entries and returns it
+      const entry = wiCreate(op.targetBook, data);
+      entry.comment   = op.comment;
+      entry.content   = op.content;
+      entry.key       = op.keys || [];
+      entry.disable   = false;
+      entry.constant  = false;
+      entry.selective = false;
+      entry.addMemo   = !!op.comment;
+      entry.order     = 100;
+      await wiSave(op.targetBook, data);
+      logActivity(op.action, op.comment, op.targetBook);
+      console.log(`[LAU] Created "${op.comment}" (UID ${entry.uid}) → "${op.targetBook}"`);
+
+    } else if (op.action === 'update') {
+      const entry = findEntryByUid(data.entries, op.uid);
+      if (!entry) throw new Error(`UID ${op.uid} not found in "${op.targetBook}".`);
+      if (op.content != null) entry.content = op.content;
+      if (op.comment != null) entry.comment = op.comment;
+      if (op.keys    != null) entry.key     = op.keys;
+      await wiSave(op.targetBook, data);
+      logActivity('update', entry.comment || `UID ${op.uid}`, op.targetBook);
+      console.log(`[LAU] Updated UID ${op.uid} "${entry.comment}" → "${op.targetBook}"`);
+
+    } else if (op.action === 'merge') {
+      const keepEntry   = findEntryByUid(data.entries, op.keepUid);
+      const removeEntry = findEntryByUid(data.entries, op.removeUid);
+      if (!keepEntry)   throw new Error(`Keep UID ${op.keepUid} not found in "${op.targetBook}".`);
+      if (!removeEntry) throw new Error(`Remove UID ${op.removeUid} not found in "${op.targetBook}".`);
+
+      if (op.content) keepEntry.content = op.content;
+      if (op.comment) keepEntry.comment = op.comment;
+
+      // Merge keys (deduplicate, case-insensitive)
+      const seen = new Set((keepEntry.key || []).map(k => String(k).toLowerCase()));
+      for (const k of (removeEntry.key || [])) {
+        const lk = String(k).toLowerCase();
+        if (!seen.has(lk)) { seen.add(lk); keepEntry.key = keepEntry.key || []; keepEntry.key.push(k); }
+      }
+
+      removeEntry.disable = true; // soft-delete the absorbed entry
+      await wiSave(op.targetBook, data);
+      logActivity('merge', `UID ${op.keepUid} ← ${op.removeUid}`, op.targetBook);
+      console.log(`[LAU] Merged UID ${op.removeUid} into UID ${op.keepUid} "${keepEntry.comment}" → "${op.targetBook}"`);
+
+    } else if (op.action === 'forget') {
+      const entry = findEntryByUid(data.entries, op.uid);
+      if (!entry) throw new Error(`UID ${op.uid} not found in "${op.targetBook}".`);
+      entry.disable = true;
+      await wiSave(op.targetBook, data);
+      logActivity('forget', entry.comment || `UID ${op.uid}`, op.targetBook);
+      console.log(`[LAU] Disabled UID ${op.uid} "${entry.comment}" → "${op.targetBook}"`);
+    }
+
+    // Reload the WI editor panel if it's open, so changes are visible
+    const c = ctx();
+    if (typeof c.reloadWorldInfoEditor === 'function') {
+      c.reloadWorldInfoEditor(op.targetBook, true);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // ACTIVITY LOG
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  const ACTION_ICONS = {
+    create: '📝', update: '✏️', merge: '🔗', forget: '🗑️', summarize: '📋',
+  };
+
+  function logActivity(action, label, book) {
+    activityLog.unshift({
+      icon:  ACTION_ICONS[action] || '•',
+      label: String(label || '').slice(0, 55),
+      book:  String(book  || '').slice(0, 35),
+      time:  new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    });
+    activityLog = activityLog.slice(0, 10);
+    renderActivityLog();
+  }
+
+  function renderActivityLog() {
+    const $log = $('#lau-activity-log');
+    if (!$log.length) return;
+    if (!activityLog.length) {
+      $log.html('<div class="lau-log-empty">No activity yet.</div>');
+      return;
+    }
+    $log.empty();
+    for (const e of activityLog) {
+      $log.append(`
+        <div class="lau-log-row">
+          <span class="lau-log-icon">${e.icon}</span>
+          <span class="lau-log-label">${esc(e.label)}</span>
+          <span class="lau-log-book">${esc(e.book)}</span>
+          <span class="lau-log-time">${e.time}</span>
+        </div>`);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SETTINGS PANEL
+  // ═══════════════════════════════════════════════════════════════════════════
 
   function mountUI() {
-    if($('#lau-block').length) return;
-    const $ext=$('#extensions_settings2, #extensions_settings').first();
-    if(!$ext.length){console.error('[LAU] #extensions_settings not found');return;}
+    if ($('#lau-block').length) return;
+
+    const $ext = $('#extensions_settings2, #extensions_settings').first();
+    if (!$ext.length) { console.error('[LAU] #extensions_settings not found'); return; }
 
     $ext.append(`
 <div class="lau-block" id="lau-block">
 
   <div class="lau-hdr" id="lau-hdr">
-    <span>📖</span>
+    <span class="lau-hdr-icon">📖</span>
     <span class="lau-hdr-title">Lorebook Auto-Updater</span>
-    <span id="lau-chev" class="lau-hdr-chev">▾</span>
+    <span class="lau-hdr-chev" id="lau-chev">▾</span>
   </div>
 
   <div class="lau-body" id="lau-body">
 
+    <!-- Books + Scan — two columns -->
     <div class="lau-main-row">
 
-      <!-- Left: lorebook list -->
       <div class="lau-col-books">
-        <div class="lau-sec-label">📚 Lorebooks</div>
-        <div id="lau-books-list" class="lau-books-list">
-          <div class="lau-books-msg">Loading…</div>
+        <div class="lau-col-hdr">
+          <span>📚 Lorebooks</span>
+          <span class="lau-sel-count" id="lau-sel-count">none selected</span>
         </div>
-        <div class="lau-book-btns">
-          <button class="lau-btn lau-btn-xs" id="lau-refresh">🔄</button>
-          <button class="lau-btn lau-btn-xs" id="lau-all">All</button>
-          <button class="lau-btn lau-btn-xs" id="lau-none">None</button>
+        <div class="lau-books-list" id="lau-books-list">
+          <div class="lau-msg">🔄 Loading…</div>
+        </div>
+        <div class="lau-row-btns">
+          <button class="lau-btn" id="lau-refresh">🔄 Refresh</button>
+          <button class="lau-btn" id="lau-all">All</button>
+          <button class="lau-btn" id="lau-none">None</button>
         </div>
       </div>
 
-      <!-- Right: scan controls -->
       <div class="lau-col-scan">
-        <div class="lau-sec-label">🚀 Scan</div>
-        <div class="lau-scan-msg-row">
-          <span class="lau-scan-lbl">Last</span>
-          <input type="number" class="lau-num-input" id="lau-count" min="1" max="500"/>
-          <span class="lau-scan-lbl">msgs</span>
-        </div>
-        <div class="lau-check-row" style="margin-bottom:4px;font-size:0.78em">
-          <input type="radio" name="lau-mode" id="lau-mode-precise" value="precise"/>
-          <label for="lau-mode-precise" title="One AI call per book — more accurate">🎯 Precise</label>
-          <input type="radio" name="lau-mode" id="lau-mode-fast" value="fast" style="margin-left:8px"/>
-          <label for="lau-mode-fast" title="One AI call for all books — faster">⚡ Fast</label>
+        <div class="lau-col-hdr"><span>🚀 Scan</span></div>
+        <div class="lau-msgs-row">
+          <span class="lau-lbl">Last</span>
+          <input type="number" class="lau-num" id="lau-count" min="1" max="500" />
+          <span class="lau-lbl">msgs</span>
         </div>
         <button class="lau-btn lau-btn-primary lau-scan-big" id="lau-scan-btn">🔍 Scan</button>
-        <div class="lau-stats-box" id="lau-stats-box">
+        <div class="lau-stats-box">
           <div class="lau-srow" id="lau-s-books">📚 —</div>
           <div class="lau-srow" id="lau-s-entries">📝 —</div>
           <div class="lau-srow" id="lau-s-msgs">💬 —</div>
-          <div class="lau-srow lau-s-highlight" id="lau-s-suggested">✨ —</div>
+          <div class="lau-srow lau-srow-hi" id="lau-s-suggested">✨ —</div>
         </div>
         <div class="lau-scan-info" id="lau-scan-info"></div>
       </div>
 
     </div>
 
-    <!-- Memory panel -->
-    <div class="lau-settings-toggle" id="lau-memory-hdr">
-      🧠 Memory <span id="lau-memory-count" style="color:#60a5fa;font-size:0.9em"></span> <span id="lau-memory-chev">▾</span>
+    <!-- Activity log -->
+    <div class="lau-section-hdr" id="lau-log-hdr">
+      📋 Recent activity <span id="lau-log-chev">▾</span>
     </div>
-    <div id="lau-memory-body" style="display:none;padding:4px 0 6px 0">
-      <div id="lau-memory-list" style="font-size:0.75em;color:#64748b;padding:4px 2px;max-height:160px;overflow-y:auto;line-height:1.7">
-        <em>No data in memory yet.</em>
-      </div>
-      <div class="lau-btn-row" style="margin-top:4px">
-        <button class="lau-btn lau-btn-xs" id="lau-memory-reload">🔄 Reload</button>
-        <button class="lau-btn lau-btn-xs" id="lau-memory-clear" style="color:#f87171">🗑 Clear</button>
-      </div>
+    <div id="lau-activity" style="display:none">
+      <div id="lau-activity-log"><div class="lau-log-empty">No activity yet.</div></div>
     </div>
 
-    <!-- History panel -->
-    <div class="lau-settings-toggle" id="lau-history-hdr">
-      🕓 History <span id="lau-history-chev">▾</span>
-    </div>
-    <div id="lau-history-body" style="display:none;padding:4px 0 6px 0">
-      <div id="lau-history-list" style="font-size:0.75em;color:#64748b;padding:4px 2px;max-height:160px;overflow-y:auto"></div>
-    </div>
-
-    <!-- Settings toggle -->
-    <div class="lau-settings-toggle" id="lau-settings-hdr">
+    <!-- Settings -->
+    <div class="lau-section-hdr" id="lau-settings-hdr">
       ⚙️ Settings <span id="lau-settings-chev">▾</span>
     </div>
-    <div id="lau-settings-body" style="display:none;padding:8px 0">
-      <div class="lau-check-row" style="margin-bottom:6px">
-        <input type="checkbox" id="lau-auto"/>
-        <label for="lau-auto">Auto-scan every</label>
-        <input type="number" class="lau-num-input" id="lau-interval" min="1" max="200" style="width:52px"/>
-        <label>messages</label>
-      </div>
-      <div class="lau-sec-label">🤖 AI Prompt (base)</div>
-      <textarea class="lau-prompt-area" id="lau-prompt"></textarea>
-      <div class="lau-btn-row" style="margin-top:5px">
-        <button class="lau-btn lau-btn-xs" id="lau-reset-prompt">↩️ Reset to default</button>
+    <div id="lau-settings-body" style="display:none">
+      <div class="lau-field">
+        <div class="lau-field-label">🤖 AI Prompt</div>
+        <textarea class="lau-textarea" id="lau-prompt"></textarea>
+        <button class="lau-btn" id="lau-reset-prompt" style="margin-top:5px">↩️ Reset to default</button>
       </div>
     </div>
 
   </div>
 </div>`);
 
-    const s=getSettings();
+    // Restore saved settings to UI
+    const s = getSettings();
     $('#lau-count').val(s.messageScanCount);
-    $('#lau-interval').val(s.autoInterval);
-    $('#lau-auto').prop('checked',!!s.autoEnabled);
-    $('#lau-prompt').val(s.prompt||BASE_PROMPT);
-    $(`#lau-mode-${s.scanMode||'precise'}`).prop('checked',true);
-    if(collapsed) $('#lau-body').hide();
+    $('#lau-prompt').val(s.prompt);
+
+    if (collapsed) $('#lau-body').hide();
 
     populateBookList();
     wireUI();
-    resetStats();
   }
 
-  // ─── Book list with tags ──────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BOOK LIST (checkbox rows — mobile-friendly, no Ctrl required)
+  // ═══════════════════════════════════════════════════════════════════════════
 
   async function populateBookList() {
-    const $list=$('#lau-books-list');
-    $list.html('<div class="lau-books-msg">🔄 Loading…</div>');
-    const names=await serverGetNames();
-    const s=getSettings();
+    const $list = $('#lau-books-list').html('<div class="lau-msg">🔄 Loading…</div>');
+
+    let names;
+    try {
+      names = await wiGetNames();
+    } catch (e) {
+      $list.html(`<div class="lau-msg lau-msg-err">❌ ${esc(e.message)}</div>`);
+      return;
+    }
+
+    const s = getSettings();
     $list.empty();
-    if(!names.length){
-      $list.html('<div class="lau-books-msg lau-books-err">No lorebooks found.<br><small>Check console F12</small></div>');
+
+    if (!names.length) {
+      $list.html('<div class="lau-msg lau-msg-warn">⚠️ No lorebooks found in ST.</div>');
       return;
     }
-    names.forEach(name=>{
-      const on=s.selectedBooks.includes(name);
-      const meta=getBookMeta(name);
-      const tag=meta.tag||'world';
-      const tagInfo=BOOK_TAGS[tag]||BOOK_TAGS.world;
-      const desc=meta.description||'';
-      const $r=$(`
-<div class="lau-book-row${on?' lau-on':''}" data-n="${esc(name)}">
-  <span class="lau-ck">${on?'☑':'☐'}</span>
-  <span class="lau-bname">${esc(name)}</span>
-  <span class="lau-book-tag" data-book="${esc(name)}" title="Click to change role">${tagInfo.emoji}</span>
-</div>`);
 
-      // Expand row to show tag/description editor
-      const $editor=$(`
-<div class="lau-book-editor" data-book="${esc(name)}" style="display:none;padding:6px 8px 8px 28px;border-bottom:1px solid rgba(255,255,255,0.05)">
-  <div style="font-size:0.72em;color:#64748b;margin-bottom:4px">Role</div>
-  <select class="lau-f-select lau-book-tag-sel" data-book="${esc(name)}" style="margin-bottom:6px;font-size:0.8em">
-    ${Object.entries(BOOK_TAGS).map(([k,v])=>`<option value="${k}" ${tag===k?'selected':''}>${v.emoji} ${v.label}</option>`).join('')}
-  </select>
-  <div style="font-size:0.72em;color:#64748b;margin-bottom:4px">Description (optional)</div>
-  <input type="text" class="lau-f-input lau-book-desc-inp" data-book="${esc(name)}" placeholder="E.g.: Contains lore about the demon race only" value="${esc(desc)}" style="font-size:0.78em"/>
-</div>`);
-
-      $r.find('.lau-book-tag').on('click',function(ev){
-        ev.stopPropagation();
-        $editor.slideToggle(140);
-      });
-      $r.on('click',function(ev){
-        if($(ev.target).hasClass('lau-book-tag')) return;
-        const n=String($(this).data('n'));
-        const sl=getSettings().selectedBooks;
-        const i=sl.indexOf(n);
-        if(i===-1){sl.push(n);$(this).addClass('lau-on').find('.lau-ck').text('☑');}
-        else{sl.splice(i,1);$(this).removeClass('lau-on').find('.lau-ck').text('☐');}
+    for (const name of names) {
+      const on  = s.selectedBooks.includes(name);
+      const $row = $(`<div class="lau-book-row${on ? ' lau-on' : ''}">
+        <span class="lau-ck">${on ? '☑' : '☐'}</span>
+        <span class="lau-bname">${esc(name)}</span>
+      </div>`);
+      // Store name directly on DOM node — avoids HTML encoding issues with data attributes
+      $row[0]._lauName = name;
+      $row.on('click', function () {
+        const n  = this._lauName;
+        const sl = getSettings().selectedBooks;
+        const i  = sl.indexOf(n);
+        if (i === -1) { sl.push(n);    $(this).addClass('lau-on').find('.lau-ck').text('☑'); }
+        else          { sl.splice(i,1); $(this).removeClass('lau-on').find('.lau-ck').text('☐'); }
         save();
+        updateSelCount();
       });
-      $list.append($r).append($editor);
+      $list.append($row);
+    }
+
+    updateSelCount();
+  }
+
+  function updateSelCount() {
+    const sel   = getSettings().selectedBooks;
+    const total = $('#lau-books-list .lau-book-row').length;
+    const $el   = $('#lau-sel-count');
+    if (sel.length) {
+      $el.text(`${sel.length}/${total}`).css('color', '#4ade80');
+    } else {
+      $el.text('none selected').css('color', '#f87171');
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // WIRE UI EVENTS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  function wireUI() {
+    let _db = {};
+    const deb = (k, fn, ms = 400) => { clearTimeout(_db[k]); _db[k] = setTimeout(fn, ms); };
+
+    // Main panel toggle
+    $('#lau-hdr').on('click', () => {
+      collapsed = !collapsed;
+      $('#lau-body').slideToggle(180);
+      $('#lau-chev').text(collapsed ? '▾' : '▴');
     });
 
-    // Tag selector change
-    $list.find('.lau-book-tag-sel').on('change',function(){
-      const n=String($(this).data('book'));
-      const m=getBookMeta(n);
-      m.tag=$(this).val();
+    // Activity log toggle
+    let logOpen = false;
+    $('#lau-log-hdr').on('click', () => {
+      logOpen = !logOpen;
+      $('#lau-activity').slideToggle(150);
+      $('#lau-log-chev').text(logOpen ? '▴' : '▾');
+      if (logOpen) renderActivityLog();
+    });
+
+    // Settings toggle
+    let settingsOpen = false;
+    $('#lau-settings-hdr').on('click', () => {
+      settingsOpen = !settingsOpen;
+      $('#lau-settings-body').slideToggle(150);
+      $('#lau-settings-chev').text(settingsOpen ? '▴' : '▾');
+    });
+
+    // Book list controls
+    $('#lau-refresh').on('click', () => populateBookList());
+    $('#lau-all').on('click', async () => {
+      const names = await wiGetNames();
+      getSettings().selectedBooks = [...names];
       save();
-      // Update emoji in row
-      const tagInfo=BOOK_TAGS[m.tag]||BOOK_TAGS.world;
-      $(`.lau-book-row[data-n="${esc(n)}"] .lau-book-tag`).text(tagInfo.emoji);
+      $('#lau-books-list .lau-book-row').addClass('lau-on').find('.lau-ck').text('☑');
+      updateSelCount();
+    });
+    $('#lau-none').on('click', () => {
+      getSettings().selectedBooks = [];
+      save();
+      $('#lau-books-list .lau-book-row').removeClass('lau-on').find('.lau-ck').text('☐');
+      updateSelCount();
     });
 
-    // Description input change
-    let descDb={};
-    $list.find('.lau-book-desc-inp').on('input',function(){
-      const n=String($(this).data('book'));
-      const val=$(this).val();
-      clearTimeout(descDb[n]);
-      descDb[n]=setTimeout(()=>{getBookMeta(n).description=val;save();},400);
+    // Scan count
+    $('#lau-count').on('input', function () {
+      deb('cnt', () => { getSettings().messageScanCount = Math.max(1, parseInt(this.value) || 20); save(); });
     });
-  }
 
-  // ─── Wire UI ──────────────────────────────────────────────────────────────
-
-  function wireUI(){
-    let _db={};
-    const deb=(k,fn,ms=380)=>{clearTimeout(_db[k]);_db[k]=setTimeout(fn,ms);};
-
-    $('#lau-hdr').on('click',()=>{collapsed=!collapsed;$('#lau-body').slideToggle(180);$('#lau-chev').text(collapsed?'▾':'▴');});
-
-    let settingsOpen=false;
-    $('#lau-settings-hdr').on('click',()=>{settingsOpen=!settingsOpen;$('#lau-settings-body').slideToggle(160);$('#lau-settings-chev').text(settingsOpen?'▴':'▾');});
-
-    let memOpen=false;
-    $('#lau-memory-hdr').on('click',()=>{memOpen=!memOpen;$('#lau-memory-body').slideToggle(160);$('#lau-memory-chev').text(memOpen?'▴':'▾');if(memOpen) renderMemoryPanel();});
-    $('#lau-memory-reload').on('click',async()=>{
-      const s=getSettings();
-      if(!s.selectedBooks.length){alert('Select lorebooks first.');return;}
-      const $btn=$('#lau-memory-reload').text('Loading…').prop('disabled',true);
-      snapBooks={};
-      for(const name of s.selectedBooks){const data=await serverGetBook(name);if(data) snapBooks[name]=data;}
-      renderMemoryPanel();
-      $btn.text('🔄 Reload').prop('disabled',false);
+    // Prompt
+    $('#lau-prompt').on('input', function () {
+      deb('pmt', () => { getSettings().prompt = this.value.trim() || DEFAULT_PROMPT; save(); });
     });
-    $('#lau-memory-clear').on('click',()=>{snapBooks={};previewData=[];renderMemoryPanel();updateReopenBtn();$('#lau-memory-count').text('');});
+    $('#lau-reset-prompt').on('click', () => {
+      getSettings().prompt = DEFAULT_PROMPT;
+      $('#lau-prompt').val(DEFAULT_PROMPT);
+      save();
+    });
 
-    let histOpen=false;
-    $('#lau-history-hdr').on('click',()=>{histOpen=!histOpen;$('#lau-history-body').slideToggle(160);$('#lau-history-chev').text(histOpen?'▴':'▾');if(histOpen) renderHistoryPanel();});
-
-    $('#lau-refresh').on('click',()=>populateBookList());
-    $('#lau-all').on('click',async()=>{const names=await serverGetNames();getSettings().selectedBooks=[...names];save();$('#lau-books-list .lau-book-row').addClass('lau-on').find('.lau-ck').text('☑');});
-    $('#lau-none').on('click',()=>{getSettings().selectedBooks=[];save();$('#lau-books-list .lau-book-row').removeClass('lau-on').find('.lau-ck').text('☐');});
-
-    $('#lau-count').on('input',function(){deb('c',()=>{getSettings().messageScanCount=parseInt(this.value)||20;save();});});
-    $('#lau-auto').on('change',function(){getSettings().autoEnabled=this.checked;autoCounter=0;save();});
-    $('#lau-interval').on('input',function(){deb('i',()=>{getSettings().autoInterval=parseInt(this.value)||5;autoCounter=0;save();});});
-    $('#lau-prompt').on('input',function(){deb('p',()=>{getSettings().prompt=this.value||BASE_PROMPT;save();});});
-    $('#lau-reset-prompt').on('click',()=>{getSettings().prompt=BASE_PROMPT;$('#lau-prompt').val(BASE_PROMPT);save();});
-    $('input[name="lau-mode"]').on('change',function(){getSettings().scanMode=$(this).val();save();});
-    $('#lau-scan-btn').on('click',()=>{if(!scanning) runScan();});
+    // Scan button
+    $('#lau-scan-btn').on('click', () => { if (!scanning) runScan(); });
   }
 
-  // ─── Scan UI helpers ──────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SCAN PANEL HELPERS
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  function setScanBtn(e){$('#lau-scan-btn').prop('disabled',!e).text(e?'🔍 Scan':'⏳ Scanning…');}
-
-  function setScanInfo(msg,type){
-    const colors={info:'#94a3b8',warn:'#f59e0b',err:'#f87171',ok:'#4ade80'};
-    $('#lau-scan-info').css('color',colors[type]||'#94a3b8').text(msg);
+  function setScanBtn(enabled) {
+    $('#lau-scan-btn')
+      .prop('disabled', !enabled)
+      .text(enabled ? '🔍 Scan' : '⏳ Scanning…');
   }
 
-  function resetStats(){$('#lau-s-books').text('📚 —');$('#lau-s-entries').text('📝 —');$('#lau-s-msgs').text('💬 —');$('#lau-s-suggested').text('✨ —').removeClass('lau-s-highlight-on');}
-
-  function setStats(d){
-    if(d.books!=null) $('#lau-s-books').text(`📚 ${d.books} book(s) loaded`);
-    if(d.entries!=null) $('#lau-s-entries').text(`📝 ${d.entries} existing entries`);
-    if(d.msgs!=null) $('#lau-s-msgs').text(`💬 ${d.msgs} messages scanned`);
-    if(d.suggested!=null) $('#lau-s-suggested').text(`✨ ${d.suggested} suggestion(s)`).addClass('lau-s-highlight-on');
+  function setScanInfo(msg, type) {
+    const colors = { info: '#94a3b8', warn: '#f59e0b', err: '#f87171', ok: '#4ade80' };
+    $('#lau-scan-info').css('color', colors[type] || '#94a3b8').text(msg);
   }
 
-  // ─── Memory panel ─────────────────────────────────────────────────────────
+  function resetStats() {
+    $('#lau-s-books').text('📚 —');
+    $('#lau-s-entries').text('📝 —');
+    $('#lau-s-msgs').text('💬 —');
+    $('#lau-s-suggested').text('✨ —').css('color', '');
+  }
 
-  function renderMemoryPanel(){
-    const books=Object.entries(snapBooks);
-    const $list=$('#lau-memory-list');
-    if(!books.length){
-      $list.html('<em style="color:#64748b">No data in memory yet. Run a scan or click Reload.</em>');
-      $('#lau-memory-count').text('');
-      return;
+  function setStats(d) {
+    if (d.books     != null) $('#lau-s-books').text(`📚 ${d.books} book(s) loaded`);
+    if (d.entries   != null) $('#lau-s-entries').text(`📝 ${d.entries} existing entries`);
+    if (d.msgs      != null) $('#lau-s-msgs').text(`💬 ${d.msgs} messages scanned`);
+    if (d.suggested != null) {
+      $('#lau-s-suggested')
+        .text(d.suggested > 0 ? `✨ ${d.suggested} suggestion(s)` : '✨ Nothing to update')
+        .css('color', d.suggested > 0 ? '#4ade80' : '#94a3b8');
     }
-    let total=0;
-    const lines=[];
-    books.forEach(([name,data])=>{
-      const entries=Object.values(data?.entries||{});
-      const meta=getBookMeta(name);
-      const tag=meta?.tag||'world';
-      const tagInfo=BOOK_TAGS[tag]||BOOK_TAGS.world;
-      const locked=meta?.lockedUids||[];
-      total+=entries.length;
-      lines.push(`<div style="margin-bottom:4px"><span style="color:#93c5fd;font-weight:bold">${tagInfo.emoji} ${esc(name)}</span> <span style="color:#475569">(${entries.length})</span></div>`);
-      entries.forEach(e=>{
-        const isLock=locked.includes(e.uid);
-        lines.push(`<div style="padding-left:10px;display:flex;align-items:center;gap:6px">
-          <button class="lau-lock-btn" data-book="${esc(name)}" data-uid="${e.uid}" title="${isLock?'Unlock':'Lock — never suggest updates'}" style="background:none;border:none;cursor:pointer;font-size:0.9em;padding:0;color:${isLock?'#f59e0b':'#475569'}">${isLock?'🔒':'🔓'}</button>
-          <span style="color:${isLock?'#64748b':'#cbd5e1'};font-size:0.8em">${esc(e.comment||'—')}</span>
-          <span style="color:#334155;font-size:0.72em">uid:${e.uid}</span>
-        </div>`);
-      });
-    });
-    $list.html(lines.join(''));
-    $('#lau-memory-count').text(`(${books.length} books, ${total} entries)`);
-
-    // Wire lock buttons
-    $list.find('.lau-lock-btn').on('click',function(){
-      const bookName=String($(this).data('book'));
-      const uid=Number($(this).data('uid'));
-      const nowLocked=toggleLock(bookName,uid);
-      $(this).css('color',nowLocked?'#f59e0b':'#475569').text(nowLocked?'🔒':'🔓');
-      $(this).next('span').css('color',nowLocked?'#64748b':'#cbd5e1');
-    });
   }
 
-  // ─── History panel ────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PREVIEW POPUP
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  function renderHistoryPanel(){
-    const history=loadHistory().reverse();
-    const $list=$('#lau-history-list');
-    if(!history.length){$list.html('<em style="color:#64748b">No scans recorded yet.</em>');return;}
-    const lines=history.map((h,i)=>{
-      const d=new Date(h.date);
-      const dateStr=`${d.toLocaleDateString()} ${d.toHours?d.toLocaleTimeString():''}`;
-      return `<div style="padding:5px 2px;border-bottom:1px solid rgba(255,255,255,0.05)">
-        <span style="color:#64748b;font-size:0.78em">${d.toLocaleString()}</span><br>
-        <span style="color:#94a3b8;font-size:0.8em">📚 ${(h.books||[]).join(', ')||'—'}</span><br>
-        <span style="color:#4ade80;font-size:0.78em">+${h.created} new</span>
-        <span style="color:#60a5fa;font-size:0.78em;margin-left:6px">↺ ${h.updated} updated</span>
-        <span style="color:#64748b;font-size:0.78em;margin-left:6px">💬 ${h.msgs} msgs</span>
-      </div>`;
-    });
-    $list.html(lines.join(''));
-  }
+  const ACTION_META = {
+    create:    { badge: 'new',       bdgCls: 'b-create',    cardCls: 'c-create'    },
+    update:    { badge: 'update',    bdgCls: 'b-update',    cardCls: 'c-update'    },
+    merge:     { badge: 'merge',     bdgCls: 'b-merge',     cardCls: 'c-merge'     },
+    forget:    { badge: 'forget',    bdgCls: 'b-forget',    cardCls: 'c-forget'    },
+    summarize: { badge: 'summarize', bdgCls: 'b-summarize', cardCls: 'c-summarize' },
+  };
 
-  // ─── Reopen button ────────────────────────────────────────────────────────
-
-  function updateReopenBtn(){
-    const has=previewData.length>0;
-    let $btn=$('#lau-reopen-btn');
-    if(!has){$btn.remove();return;}
-    const unapplied=previewData.filter(e=>!e.applied&&e.action!=='skip').length;
-    const label=unapplied>0?`📋 Show last results (${unapplied} pending)`:'📋 Show last results';
-    if(!$btn.length){
-      $btn=$(`<button class="lau-btn lau-btn-xs" id="lau-reopen-btn" style="width:100%;margin-top:4px"></button>`);
-      $btn.on('click',()=>openPopup());
-      $('#lau-scan-info').before($btn);
-    }
-    $btn.text(label);
-  }
-
-  // ─── Preview popup ────────────────────────────────────────────────────────
-
-  function openPopup(){
+  function openPopup() {
     $('#lau-overlay').remove();
-    const bookOptHtml=Object.keys(snapBooks).map(n=>`<option value="${esc(n)}">${esc(n)}</option>`).join('');
-    const cn=previewData.filter(e=>e.action==='create').length;
-    const un=previewData.filter(e=>e.action==='update').length;
-    const sn=previewData.filter(e=>e.action==='skip').length;
-    const low=previewData.filter(e=>e.confidence==='low').length;
+
+    const counts      = countByAction(previewData);
+    const total       = previewData.length;
+    const bookNames   = Object.keys(previewBooks);
+    const bookOptHtml = bookNames.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
 
     $('body').append(`
 <div id="lau-overlay">
   <div id="lau-popup">
+
     <div class="lau-pop-hdr">
-      <div class="lau-pop-title">📖 Preview — Lorebook Suggestions</div>
-      <div class="lau-pop-hdr-right">
+      <span class="lau-pop-title">📖 Preview — ${total} suggestion(s)</span>
+      <div class="lau-pop-hdr-r">
         <button class="lau-btn lau-btn-xs" id="lau-expand-all">Expand all</button>
         <button class="lau-btn lau-btn-xs" id="lau-collapse-all">Collapse all</button>
-        <button class="lau-close-x" id="lau-close-pop">✕</button>
+        <button class="lau-pop-close" id="lau-pop-close">✕</button>
       </div>
     </div>
-    <div class="lau-tabs" id="lau-pop-tabs">
-      <div class="lau-tab active" data-f="all">All (${previewData.length})</div>
-      <div class="lau-tab" data-f="create">🟢 New (${cn})</div>
-      <div class="lau-tab" data-f="update">🔵 Updated (${un})</div>
-      <div class="lau-tab" data-f="skip">⚫ Skipped (${sn})</div>
-      ${low?`<div class="lau-tab" data-f="low">⚠️ Low conf (${low})</div>`:''}
+
+    <div class="lau-pop-tabs">
+      <div class="lau-tab active" data-f="all">All (${total})</div>
+      <div class="lau-tab" data-f="create">📝 New (${counts.create})</div>
+      <div class="lau-tab" data-f="update">✏️ Update (${counts.update})</div>
+      <div class="lau-tab" data-f="merge">🔗 Merge (${counts.merge})</div>
+      <div class="lau-tab" data-f="forget">🗑️ Forget (${counts.forget})</div>
+      <div class="lau-tab" data-f="summarize">📋 Summary (${counts.summarize})</div>
     </div>
-    <div class="lau-stats">
-      <div class="lau-stat"><b class="g">${cn}</b> new</div>
-      <div class="lau-stat"><b class="b">${un}</b> updated</div>
-      <div class="lau-stat"><b class="gr">${sn}</b> skipped</div>
-      ${low?`<div class="lau-stat"><b style="color:#f59e0b">${low}</b> low-conf</div>`:''}
-    </div>
-    <div class="lau-sort-bar">Sort: <select id="lau-sort"><option value="action">Action type</option><option value="name">Name A–Z</option><option value="confidence">Confidence</option></select></div>
-    <div id="lau-list"></div>
+
+    <div id="lau-card-list"></div>
+
     <div class="lau-pop-foot">
-      <div class="lau-foot-info">Review, edit, then apply.</div>
-      <div class="lau-foot-right">
+      <span class="lau-foot-hint">Review and edit entries, then apply.</span>
+      <div class="lau-foot-btns">
         <button class="lau-btn" id="lau-discard">✕ Discard</button>
-        <button class="lau-btn lau-apply-btn" id="lau-apply-all">✅ Apply all</button>
+        <button class="lau-btn lau-btn-apply" id="lau-apply-all">✅ Apply all</button>
       </div>
     </div>
+
   </div>
 </div>`);
 
-    renderCards('all',bookOptHtml);
+    renderCards('all', bookOptHtml);
     wirePopup(bookOptHtml);
   }
 
-  function renderCards(filter,bookOptHtml){
-    const $list=$('#lau-list').empty();
-    let items;
-    if(filter==='low') items=previewData.filter(e=>e.confidence==='low');
-    else if(filter==='all') items=previewData;
-    else items=previewData.filter(e=>e.action===filter);
-    if(!items.length){$list.html('<div class="lau-empty">Nothing here.</div>');return;}
-    items.forEach(e=>$list.append(buildCard(e,bookOptHtml)));
-    enableDrag($list[0]);
+  function renderCards(filter, bookOptHtml) {
+    const $list = $('#lau-card-list').empty();
+    const items = filter === 'all'
+      ? previewData
+      : previewData.filter(op => op.action === filter);
+
+    if (!items.length) {
+      $list.html('<div class="lau-empty">Nothing in this category.</div>');
+      return;
+    }
+    items.forEach(op => $list.append(buildCard(op, bookOptHtml)));
   }
 
-  function buildCard(entry,bookOptHtml){
-    const badge=entry.applied?'done':entry.action;
-    const bLabel=entry.applied?'✅ applied':entry.action;
-    const cClass=`c-${entry.applied?'done':entry.action}`;
-    const bOpts=bookOptHtml.replace(`value="${esc(entry.targetBook)}"`,`value="${esc(entry.targetBook)}" selected`);
+  function bookSelect(bookOptHtml, selected) {
+    return bookOptHtml.replace(`value="${esc(selected)}"`, `value="${esc(selected)}" selected`);
+  }
 
-    const confColor={high:'#4ade80',medium:'#f59e0b',low:'#f87171'}[entry.confidence||'medium']||'#94a3b8';
-    const confBadge=`<span style="font-size:0.65em;padding:1px 5px;border-radius:8px;background:rgba(0,0,0,0.3);color:${confColor};border:1px solid ${confColor}40">${entry.confidence||'?'}</span>`;
+  function buildCard(op, bookOptHtml) {
+    const meta      = ACTION_META[op.action] || ACTION_META.create;
+    const appliedCls = op.applied ? 'c-applied' : meta.cardCls;
+    const badge      = op.applied ? '✅ applied' : meta.badge;
+    const bdgCls     = op.applied ? 'b-applied'  : meta.bdgCls;
+    const bOpts      = bookSelect(bookOptHtml, op.targetBook);
 
-    // Build diff HTML for updates
-    let diffHtml='';
-    if(entry.action==='update'&&entry.originalContent!=null){
-      diffHtml=`<div class="lau-diff-wrap">
-        <div class="lau-f-label" style="margin-bottom:4px">📊 Diff <span style="font-size:0.8em;color:#475569">(green = added)</span></div>
-        <div class="lau-diff-view">${computeDiff(entry.originalContent,entry.content)}</div>
-      </div>`;
+    // Title line shown in collapsed header
+    let headerTitle = '';
+    if (op.action === 'update')  headerTitle = `UID ${op.uid}${op.comment ? ' — ' + op.comment : ''}`;
+    else if (op.action === 'merge')  headerTitle = `UID ${op.keepUid} ← ${op.removeUid}${op.comment ? ' — ' + op.comment : ''}`;
+    else if (op.action === 'forget') headerTitle = `UID ${op.uid}`;
+    else headerTitle = op.comment || '';
+
+    // Body fields per action
+    let bodyHtml = '';
+    if (op.action === 'create' || op.action === 'summarize') {
+      bodyHtml = `
+        <div class="lau-fg"><div class="lau-fl">Title</div>
+          <input class="lau-fi f-comment" type="text" value="${esc(op.comment)}"></div>
+        <div class="lau-fg"><div class="lau-fl">Content</div>
+          <textarea class="lau-ft f-content">${esc(op.content)}</textarea></div>
+        <div class="lau-frow">
+          <div class="lau-fg"><div class="lau-fl">Keywords (comma-separated)</div>
+            <input class="lau-fi f-keys" type="text" value="${esc((op.keys || []).join(', '))}"></div>
+          <div class="lau-fg lau-fg-sm"><div class="lau-fl">Target lorebook</div>
+            <select class="lau-fs f-book">${bOpts}</select></div>
+        </div>`;
+
+    } else if (op.action === 'update') {
+      bodyHtml = `
+        <div class="lau-info-pill">Updating UID <b>${op.uid}</b></div>
+        <div class="lau-fg"><div class="lau-fl">New title <em>(optional — leave blank to keep)</em></div>
+          <input class="lau-fi f-comment" type="text" value="${esc(op.comment || '')}"></div>
+        <div class="lau-fg"><div class="lau-fl">Full updated content</div>
+          <textarea class="lau-ft f-content">${esc(op.content || '')}</textarea></div>
+        <div class="lau-frow">
+          <div class="lau-fg"><div class="lau-fl">Keywords</div>
+            <input class="lau-fi f-keys" type="text" value="${esc((op.keys || []).join(', '))}"></div>
+          <div class="lau-fg lau-fg-sm"><div class="lau-fl">Lorebook</div>
+            <select class="lau-fs f-book">${bOpts}</select></div>
+        </div>`;
+
+    } else if (op.action === 'merge') {
+      bodyHtml = `
+        <div class="lau-info-pill">Keep UID <b>${op.keepUid}</b> · Disable UID <b>${op.removeUid}</b></div>
+        <div class="lau-fg"><div class="lau-fl">Merged title <em>(optional)</em></div>
+          <input class="lau-fi f-comment" type="text" value="${esc(op.comment || '')}"></div>
+        <div class="lau-fg"><div class="lau-fl">Merged content</div>
+          <textarea class="lau-ft f-content">${esc(op.content || '')}</textarea></div>
+        <div class="lau-fg lau-fg-sm"><div class="lau-fl">Lorebook</div>
+          <select class="lau-fs f-book">${bOpts}</select></div>`;
+
+    } else if (op.action === 'forget') {
+      bodyHtml = `
+        <div class="lau-info-pill">Will disable UID <b>${op.uid}</b></div>
+        <div class="lau-fg lau-fg-sm"><div class="lau-fl">Lorebook</div>
+          <select class="lau-fs f-book">${bOpts}</select></div>`;
     }
 
     return $(`
-<div class="lau-card ${cClass}" data-id="${entry._id}" draggable="true">
+<div class="lau-card ${appliedCls}" data-id="${op._id}">
   <div class="lau-card-hdr">
-    <span class="lau-drag-h">⠿</span>
-    <span class="lau-badge b-${badge}">${bLabel}</span>
-    ${confBadge}
-    <span class="lau-card-name">${esc(entry.comment)}</span>
-    <span class="lau-card-keys">${esc(entry.keys.slice(0,2).join(' · ')||'—')}</span>
-    <span class="lau-chevron">▼</span>
+    <span class="lau-badge ${bdgCls}">${badge}</span>
+    <span class="lau-card-title">${esc(headerTitle)}</span>
+    <span class="lau-card-chev">▼</span>
   </div>
   <div class="lau-card-body">
-    <div class="lau-f-group"><div class="lau-f-label">Entry title</div><input class="lau-f-input f-comment" type="text" value="${esc(entry.comment)}"/></div>
-    <div class="lau-f-group"><div class="lau-f-label">Content</div><textarea class="lau-f-textarea f-content">${esc(entry.content)}</textarea></div>
-    ${diffHtml}
-    <div class="lau-f-row">
-      <div class="lau-f-group"><div class="lau-f-label">Primary keywords</div><input class="lau-f-input f-keys" type="text" value="${esc(entry.keys.join(', '))}"/></div>
-      <div class="lau-f-group"><div class="lau-f-label">Secondary keywords</div><input class="lau-f-input f-seckeys" type="text" value="${esc(entry.secondary_keys.join(', '))}"/></div>
+    ${bodyHtml}
+    ${op.reason ? `<div class="lau-reason">💬 ${esc(op.reason)}</div>` : ''}
+    <div class="lau-card-foot">
+      <button class="lau-btn lau-btn-xs lau-apply-one" data-id="${op._id}">Apply this</button>
+      <button class="lau-btn lau-btn-xs lau-btn-del lau-remove" data-id="${op._id}">Remove</button>
     </div>
-    <div class="lau-f-row">
-      <div class="lau-f-group" style="max-width:72px"><div class="lau-f-label">Order</div><input class="lau-f-input f-order" type="number" value="${entry.order}"/></div>
-      <div class="lau-f-group" style="max-width:60px"><div class="lau-f-label">Depth</div><input class="lau-f-input f-depth" type="number" value="${entry.depth??4}"/></div>
-      <div class="lau-f-group" style="max-width:68px"><div class="lau-f-label">Position</div><input class="lau-f-input f-position" type="number" value="${entry.position??0}"/></div>
-    </div>
-    <div class="lau-f-row">
-      <div class="lau-f-group"><div class="lau-f-label">Target lorebook</div><select class="lau-f-select f-book">${bOpts}</select></div>
-      <div class="lau-f-group" style="max-width:110px"><div class="lau-f-label">Action</div><select class="lau-f-select f-action"><option value="create" ${entry.action==='create'?'selected':''}>create</option><option value="update" ${entry.action==='update'?'selected':''}>update</option><option value="skip" ${entry.action==='skip'?'selected':''}>skip</option></select></div>
-    </div>
-    ${entry.reason?`<div class="lau-reason">💬 ${esc(entry.reason)}</div>`:''}
-  </div>
-  <div class="lau-card-foot">
-    <button class="lau-xs lau-apply-one" data-id="${entry._id}">Apply this</button>
-    <button class="lau-xs del lau-del" data-id="${entry._id}">Remove</button>
   </div>
 </div>`);
   }
 
-  function wirePopup(bookOptHtml){
-    let af='all';
-    $(document).on('click.lau','#lau-close-pop,#lau-discard',closePopup);
-    $('#lau-overlay').on('click',e=>{if(e.target.id==='lau-overlay') closePopup();});
-    $(document).on('click.lau','.lau-tab',function(){
-      $('.lau-tab').removeClass('active');$(this).addClass('active');
-      af=$(this).data('f');syncToData();renderCards(af,bookOptHtml);
+  // Sync visible card DOM values back into previewData before tab switch / apply all
+  function syncCardsToData() {
+    $('#lau-card-list .lau-card').each(function () {
+      const id = $(this).data('id');
+      const op = previewData.find(o => o._id === id);
+      if (!op) return;
+      const g = sel => $(this).find(sel).val();
+
+      // Fields common to multiple actions
+      const book = g('.f-book');
+      if (book != null) op.targetBook = book;
+
+      if (op.action === 'create' || op.action === 'summarize' || op.action === 'update') {
+        const comment = g('.f-comment');
+        const content = g('.f-content');
+        const keys    = g('.f-keys');
+        if (comment != null) op.comment = comment || null;
+        if (content != null) op.content = content || null;
+        if (keys    != null) op.keys    = keys.split(',').map(k => k.trim()).filter(Boolean);
+      }
+      if (op.action === 'merge') {
+        const comment = g('.f-comment');
+        const content = g('.f-content');
+        if (comment != null) op.comment = comment || null;
+        if (content != null) op.content = content || null;
+      }
     });
-    $(document).on('click.lau','.lau-card-hdr',function(){$(this).closest('.lau-card').toggleClass('open');});
-    $(document).on('click.lau','#lau-expand-all',()=>$('#lau-list .lau-card').addClass('open'));
-    $(document).on('click.lau','#lau-collapse-all',()=>$('#lau-list .lau-card').removeClass('open'));
-    $(document).on('change.lau','#lau-sort',function(){
-      syncToData();
-      const v=this.value;
-      if(v==='name') previewData.sort((a,b)=>a.comment.localeCompare(b.comment));
-      else if(v==='confidence'){const o={high:0,medium:1,low:2};previewData.sort((a,b)=>(o[a.confidence]||1)-(o[b.confidence]||1));}
-      else{const o={create:0,update:1,skip:2};previewData.sort((a,b)=>(o[a.action]||0)-(o[b.action]||0));}
-      renderCards(af,bookOptHtml);
+  }
+
+  function updateTabCounts() {
+    $('.lau-tab').each(function () {
+      const f = $(this).data('f');
+      const n = f === 'all'
+        ? previewData.length
+        : previewData.filter(op => op.action === f).length;
+      $(this).text($(this).text().replace(/\(\d+\)/, `(${n})`));
     });
-    $(document).on('click.lau','.lau-del',function(){
-      const id=$(this).data('id'),i=previewData.findIndex(e=>e._id===id);
-      if(i!==-1) previewData.splice(i,1);
-      $(`#lau-list .lau-card[data-id="${id}"]`).remove();
+  }
+
+  function wirePopup(bookOptHtml) {
+    let activeFilter = 'all';
+
+    // Close buttons
+    $(document).on('click.lau', '#lau-pop-close, #lau-discard', closePopup);
+    $('#lau-overlay').on('click', e => { if (e.target.id === 'lau-overlay') closePopup(); });
+
+    // Tabs
+    $(document).on('click.lau', '.lau-tab', function () {
+      syncCardsToData();
+      $('.lau-tab').removeClass('active');
+      $(this).addClass('active');
+      activeFilter = $(this).data('f');
+      renderCards(activeFilter, bookOptHtml);
+    });
+
+    // Card expand/collapse
+    $(document).on('click.lau', '.lau-card-hdr', function (e) {
+      // Don't toggle when clicking buttons inside the header
+      if ($(e.target).closest('button').length) return;
+      $(this).closest('.lau-card').toggleClass('open');
+    });
+
+    // Expand / Collapse all
+    $(document).on('click.lau', '#lau-expand-all',   () => $('#lau-card-list .lau-card').addClass('open'));
+    $(document).on('click.lau', '#lau-collapse-all', () => $('#lau-card-list .lau-card').removeClass('open'));
+
+    // Remove individual card
+    $(document).on('click.lau', '.lau-remove', function () {
+      const id  = $(this).data('id');
+      const idx = previewData.findIndex(op => op._id === id);
+      if (idx !== -1) previewData.splice(idx, 1);
+      $(`#lau-card-list .lau-card[data-id="${id}"]`).remove();
       updateTabCounts();
     });
-    $(document).on('click.lau','.lau-apply-one',async function(){
-      syncToData();
-      const id=$(this).data('id'),entry=previewData.find(e=>e._id===id);
-      if(!entry) return;
-      const $b=$(this).text('Saving…').prop('disabled',true);
-      try{
-        await saveEntry(entry);entry.applied=true;
-        $b.text('✅ Saved');
-        $(`#lau-list .lau-card[data-id="${id}"]`).removeClass('c-new c-update c-skip').addClass('c-done');
-        updateReopenBtn();
-      }catch(err){$b.text('❌ Error').prop('disabled',false);alert('Error: '+err.message);}
-    });
-    $(document).on('click.lau','#lau-apply-all',async function(){
-      syncToData();
-      const toApply=previewData.filter(e=>e.action!=='skip'&&!e.applied);
-      if(!toApply.length){alert('Nothing to apply.');return;}
-      const $b=$(this).text('Saving…').prop('disabled',true);
-      let ok=0,fail=0;
-      for(const e of toApply){try{await saveEntry(e);e.applied=true;ok++;}catch(err){fail++;console.error('[LAU]',e.comment,err);}}
-      // Update history: mark applied count
-      try{const h=loadHistory();if(h.length){h[h.length-1].applied=(h[h.length-1].applied||0)+ok;saveHistory(h);}}catch{}
-      if(!fail){setScanInfo(`✅ Applied ${ok} entries.`,'ok');updateReopenBtn();closePopup();}
-      else{$b.text('Retry').prop('disabled',false);alert(`Applied: ${ok} ✅  Failed: ${fail} ❌`);}
-    });
-  }
 
-  function syncToData(){
-    $('#lau-list .lau-card').each(function(){
-      const id=$(this).data('id'),e=previewData.find(x=>x._id===id);
-      if(!e) return;
-      const g=s=>$(this).find(s).val();
-      e.comment=g('.f-comment')||e.comment;
-      e.content=g('.f-content')||e.content;
-      e.keys=(g('.f-keys')||'').split(',').map(s=>s.trim()).filter(Boolean);
-      e.secondary_keys=(g('.f-seckeys')||'').split(',').map(s=>s.trim()).filter(Boolean);
-      e.order=parseInt(g('.f-order'))||500;
-      e.depth=parseInt(g('.f-depth'))||4;
-      e.position=parseInt(g('.f-position'))||0;
-      e.targetBook=g('.f-book')||e.targetBook;
-      e.action=g('.f-action')||e.action;
-    });
-  }
+    // Apply single operation
+    $(document).on('click.lau', '.lau-apply-one', async function () {
+      syncCardsToData();
+      const id = $(this).data('id');
+      const op = previewData.find(o => o._id === id);
+      if (!op || op.applied) return;
 
-  function updateTabCounts(){
-    $('.lau-tab').each(function(){
-      const f=$(this).data('f');
-      if(f==='all') $(this).text(`All (${previewData.length})`);
-      else if(f==='low') $(this).text(`⚠️ Low conf (${previewData.filter(e=>e.confidence==='low').length})`);
-      else $(this).text(`${f.charAt(0).toUpperCase()+f.slice(1)} (${previewData.filter(e=>e.action===f).length})`);
-    });
-  }
-
-  function closePopup(){$(document).off('.lau');$('#lau-overlay').remove();}
-
-  // ─── Save entry ───────────────────────────────────────────────────────────
-
-  async function saveEntry(entry){
-    if(entry.action==='skip') return;
-    const bookName=entry.targetBook||getSettings().selectedBooks[0];
-    if(!bookName) throw new Error('No target lorebook.');
-    const c=ctx();
-    let data=snapBooks[bookName];
-    if(!data){data=await serverGetBook(bookName);if(data) snapBooks[bookName]=data;}
-    if(!data) throw new Error(`Could not load "${bookName}".`);
-    if(!data.entries) data.entries={};
-
-    if(entry.action==='update'&&entry.uid!=null&&data.entries[entry.uid]){
-      const ex=data.entries[entry.uid];
-      ex.comment=entry.comment;
-      ex.content=entry.content;
-      ex.key=entry.keys;
-      if(entry.secondary_keys&&entry.secondary_keys.length) ex.secondary_key=entry.secondary_keys;
-      // Preserve everything else: order, depth, position, strategy, constant, etc.
-    } else {
-      let ne;
-      if(typeof c.createWorldInfoEntry==='function') ne=c.createWorldInfoEntry(bookName,data);
-      if(!ne){
-        const uids=Object.keys(data.entries).map(Number).filter(n=>!isNaN(n));
-        const uid=uids.length?Math.max(...uids)+1:0;
-        ne={uid,key:[],secondary_key:[],comment:'',content:'',constant:false,selective:false,addMemo:false,order:500,position:0,disable:false,depth:4,role:0};
-        data.entries[uid]=ne;
+      const $btn = $(this).text('Saving…').prop('disabled', true);
+      try {
+        await applyOp(op);
+        op.applied = true;
+        $(`#lau-card-list .lau-card[data-id="${id}"]`)
+          .removeClass('c-create c-update c-merge c-forget c-summarize')
+          .addClass('c-applied');
+        $btn.text('✅ Saved').prop('disabled', false);
+      } catch (err) {
+        $btn.text('❌ Error').prop('disabled', false);
+        setScanInfo('❌ ' + err.message, 'err');
+        alert('Error applying operation:\n' + err.message);
       }
-      ne.key=entry.keys;
-      ne.comment=entry.comment;
-      ne.content=entry.content;
-      ne.addMemo=!!entry.comment;
-      ne.order=entry.order??500;
-      ne.depth=entry.depth??4;
-      ne.position=entry.position??0;
-      if(entry._existingMeta){
-        const m=entry._existingMeta;
-        if(m.constant!=null)  ne.constant =m.constant;
-        if(m.selective!=null) ne.selective=m.selective;
-        if(m.role!=null)      ne.role     =m.role;
-        if(m.strategy!=null)  ne.strategy =m.strategy;
+    });
+
+    // Apply all pending operations
+    $(document).on('click.lau', '#lau-apply-all', async function () {
+      syncCardsToData();
+      const pending = previewData.filter(op => !op.applied);
+      if (!pending.length) { alert('Nothing left to apply.'); return; }
+
+      const $btn = $(this).text('Saving…').prop('disabled', true);
+      let ok = 0, fail = 0;
+
+      for (const op of pending) {
+        try {
+          await applyOp(op);
+          op.applied = true;
+          ok++;
+        } catch (err) {
+          fail++;
+          console.error('[LAU] Apply failed for op:', op, err);
+        }
       }
-      if(entry.secondary_keys&&entry.secondary_keys.length) ne.secondary_key=entry.secondary_keys;
-    }
 
-    await c.saveWorldInfo(bookName,data);
-    if(typeof c.reloadWorldInfoEditor==='function') c.reloadWorldInfoEditor(bookName,true);
-    console.log('[LAU] Saved:',entry.comment,'→',bookName);
-  }
+      $btn.prop('disabled', false);
 
-  // ─── Drag sort ────────────────────────────────────────────────────────────
-
-  function enableDrag(list){
-    let dragId=null;
-    list.querySelectorAll('.lau-card').forEach(card=>{
-      card.addEventListener('dragstart',e=>{dragId=card.dataset.id;setTimeout(()=>card.style.opacity='0.45',0);e.dataTransfer.effectAllowed='move';});
-      card.addEventListener('dragend',()=>{card.style.opacity='';list.querySelectorAll('.lau-card').forEach(c=>c.style.outline='');});
-      card.addEventListener('dragover',e=>{e.preventDefault();list.querySelectorAll('.lau-card').forEach(c=>c.style.outline='');if(card.dataset.id!==dragId) card.style.outline='2px solid #3b82f6';});
-      card.addEventListener('drop',e=>{
-        e.preventDefault();const toId=card.dataset.id;if(dragId===toId) return;
-        const fi=previewData.findIndex(x=>x._id===dragId),ti=previewData.findIndex(x=>x._id===toId);
-        if(fi<0||ti<0) return;const[m]=previewData.splice(fi,1);previewData.splice(ti,0,m);
-        const $d=$(`#lau-list .lau-card[data-id="${dragId}"]`),$t=$(`#lau-list .lau-card[data-id="${toId}"]`);
-        if(fi<ti) $t.after($d); else $t.before($d);
-        list.querySelectorAll('.lau-card').forEach(c=>c.style.outline='');
-      });
+      if (!fail) {
+        setScanInfo(`✅ Applied ${ok} operation(s) successfully.`, 'ok');
+        closePopup();
+      } else {
+        $btn.text('Retry');
+        setScanInfo(`Applied ${ok}, failed ${fail}. See console (F12).`, 'warn');
+        alert(`Applied: ${ok} ✅   Failed: ${fail} ❌\nCheck the browser console (F12) for details.`);
+      }
     });
   }
 
-  function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+  function closePopup() {
+    $(document).off('.lau');
+    $('#lau-overlay').remove();
+  }
 
-  // ─── Boot ─────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // UTILITIES
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  jQuery(function(){
-    try{
-      const{eventSource,event_types}=ctx();
-      eventSource.on(event_types.APP_READY,()=>mountUI());
-      eventSource.on(event_types.MESSAGE_RECEIVED,onMessage);
-      eventSource.on(event_types.MESSAGE_SENT,onMessage);
+  function esc(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BOOT
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  jQuery(function () {
+    try {
+      const { eventSource, event_types } = ctx();
+      eventSource.on(event_types.APP_READY, () => mountUI());
       console.log('[Lorebook Auto-Updater v2.0] loaded ✓');
-    }catch(e){console.error('[LAU] Boot failed:',e);}
+    } catch (e) {
+      console.error('[LAU] Boot failed:', e);
+    }
   });
 
 })();
