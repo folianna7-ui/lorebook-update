@@ -92,6 +92,19 @@ If nothing meaningful happened: {"operations": []}`;
     messageScanCount: 20,
     prompt:           DEFAULT_PROMPT,
     bookMeta:         {},   // { [bookName]: { description: '', tags: '' } }
+    promptPresets:    {},   // { [presetName]: promptString }
+    entryDefaults: {        // defaults applied when creating new entries
+      order:     100,
+      position:  0,         // 0=↑Char 1=↓Char 2=↑AN 3=↓AN 4=↑EM 5=↓EM
+      constant:  false,
+      selective: false,
+    },
+    // Feature AI-1/2/3/4
+    includeCharContext: true,  // inject character card + persona into prompt
+    entryPreviewChars:  1000,  // max chars shown per entry to AI (0 = unlimited)
+    relevanceSorting:   true,  // show keyword-matching entries first
+    scanOnlyNew:        false, // scan only messages since last successful scan
+    lastScans:          {},    // { [chatId]: lastMsgIndex } — persisted per chat
   };
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -119,6 +132,14 @@ If nothing meaningful happened: {"operations": []}`;
     if (!(s.messageScanCount >= 1))       s.messageScanCount = 20;
     if (typeof s.prompt !== 'string')     s.prompt           = DEFAULT_PROMPT;
     if (!s.bookMeta || typeof s.bookMeta !== 'object') s.bookMeta = {};
+    if (!s.promptPresets || typeof s.promptPresets !== 'object') s.promptPresets = {};
+    if (!s.entryDefaults || typeof s.entryDefaults !== 'object') s.entryDefaults = {};
+    s.entryDefaults = { ...DEFAULTS.entryDefaults, ...s.entryDefaults };
+    if (typeof s.includeCharContext !== 'boolean') s.includeCharContext = true;
+    if (!(s.entryPreviewChars >= 0))               s.entryPreviewChars = 1000;
+    if (typeof s.relevanceSorting !== 'boolean')   s.relevanceSorting  = true;
+    if (typeof s.scanOnlyNew !== 'boolean')        s.scanOnlyNew       = false;
+    if (!s.lastScans || typeof s.lastScans !== 'object') s.lastScans   = {};
     return s;
   }
 
@@ -240,40 +261,121 @@ If nothing meaningful happened: {"operations": []}`;
   // PROMPT BUILDING
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // Show up to this many chars of entry content in the prompt.
-  // Enough for AI to see full entries and extend them properly, not rewrite.
-  const ENTRY_PREVIEW_CHARS = 1000;
-
-  function buildBookSummary(books) {
+  // Feature AI-1: extract character card / persona from ST context
+  function buildCharacterContext(c) {
     const lines = [];
+
+    const uname = c.name1 || 'User';
+    const cname = c.name2 || 'Character';
+    lines.push(`User name: ${uname}`);
+    lines.push(`Character name: ${cname}`);
+
+    // Character card fields — try multiple access paths ST uses
+    const char = (c.characters && c.characterId != null)
+      ? (c.characters[c.characterId] || {})
+      : {};
+
+    const desc     = (char.description     || c.description     || '').trim();
+    const pers     = (char.personality     || c.personality     || '').trim();
+    const scen     = (char.scenario        || c.scenario        || '').trim();
+    const sysprompt= (char.system_prompt   || c.system_prompt   || '').trim();
+
+    if (desc)      lines.push(`Character description: ${desc.slice(0, 600)}`);
+    if (pers)      lines.push(`Personality: ${pers.slice(0, 400)}`);
+    if (scen)      lines.push(`Scenario: ${scen.slice(0, 400)}`);
+    if (sysprompt) lines.push(`System prompt excerpt: ${sysprompt.slice(0, 300)}`);
+
+    // Active persona
+    const personaId = c.persona_description !== undefined
+      ? null   // some ST builds expose it directly
+      : null;
+    const personaText = (c.persona_description || '').trim();
+    if (personaText) lines.push(`User persona: ${personaText.slice(0, 300)}`);
+
+    return lines.join('\n');
+  }
+
+  // Feature AI-2: score an entry by how many of its keys appear in recent text
+  function scoreEntryRelevance(entry, recentLower) {
+    const keys = (entry.key || []);
+    if (!keys.length || !recentLower) return 0;
+    let hits = 0;
+    for (const k of keys) {
+      if (recentLower.includes(String(k).toLowerCase())) hits++;
+    }
+    return hits;
+  }
+
+  // Feature AI-2+3: build lorebook summary with relevance sorting + truncation tracking
+  // Returns { summary: string, truncatedCount: number }
+  function buildBookSummary(books, recentText, s) {
+    const previewChars   = s?.entryPreviewChars ?? 1000;
+    const doRelevance    = s?.relevanceSorting ?? true;
+    const recentLower    = recentText ? recentText.toLowerCase() : '';
+
+    const lines          = [];
+    let   truncatedCount = 0;
+
     for (const [name, data] of Object.entries(books)) {
       const active = Object.values(data?.entries || {}).filter(e => !e.disable);
       const meta   = getBookMeta(name);
       lines.push(`\n[Lorebook: "${name}" — ${active.length} active entries]`);
       if (meta.description) lines.push(`  Purpose: ${meta.description}`);
       if (meta.tags)        lines.push(`  Tags: ${meta.tags}`);
-      for (const e of active) {
+
+      // Feature AI-2: split into relevant vs. other
+      let sorted = active;
+      if (doRelevance && recentLower) {
+        const scored = active.map(e => ({ e, score: scoreEntryRelevance(e, recentLower) }));
+        const relevant = scored.filter(x => x.score > 0).sort((a, b) => b.score - a.score);
+        const other    = scored.filter(x => x.score === 0);
+        sorted = [...relevant.map(x => x.e), ...other.map(x => x.e)];
+
+        if (relevant.length && other.length) {
+          // We'll inject a separator later — mark boundary
+          sorted._boundary = relevant.length;
+        }
+      }
+
+      sorted.forEach((e, idx) => {
+        // Feature AI-2: separator between relevant and other
+        if (sorted._boundary && idx === sorted._boundary) {
+          lines.push(`  --- entries below were NOT triggered by recent chat ---`);
+        }
+
         const keys    = (e.key || []).slice(0, 5).join(', ') || '—';
         const content = (e.content || '').trim();
-        const shown   = content.slice(0, ENTRY_PREVIEW_CHARS);
-        const clipped = content.length > ENTRY_PREVIEW_CHARS;
+
+        // Feature AI-3: apply configurable preview limit
+        const limit   = previewChars > 0 ? previewChars : Infinity;
+        const shown   = content.slice(0, limit);
+        const clipped = previewChars > 0 && content.length > previewChars;
+        if (clipped) truncatedCount++;
+
         lines.push(`  UID ${e.uid} | "${e.comment || '(no title)'}" | keys: [${keys}]`);
         if (shown) {
           shown.split('\n').forEach(l => lines.push(`    ${l}`));
-          if (clipped) lines.push(`    …(content truncated)`);
+          if (clipped) lines.push(`    …(truncated — ${content.length - previewChars} chars hidden)`);
         }
-      }
+      });
     }
-    return lines.join('\n').trim() || '(no entries yet)';
+
+    return {
+      summary:        lines.join('\n').trim() || '(no entries yet)',
+      truncatedCount,
+    };
   }
 
-  function buildFullPrompt(customPrompt, bookSummary, msgs, count) {
+  function buildFullPrompt(customPrompt, charContext, bookSummary, msgs, msgLabel) {
+    const contextBlock = charContext
+      ? `\n=== SESSION CONTEXT ===\n${charContext}\n`
+      : '';
     return `${customPrompt}
-
+${contextBlock}
 === EXISTING LOREBOOK ENTRIES ===
 ${bookSummary}
 
-=== RECENT CHAT (last ${count} messages) ===
+=== RECENT CHAT (${msgLabel}) ===
 ${msgs.join('\n\n')}
 
 Return your JSON operations array now.`;
@@ -335,16 +437,44 @@ Return your JSON operations array now.`;
         setScanInfo(`⚠️ Loaded ${bookCount}. Could not load: ${failed.join(', ')}`, 'warn');
       }
 
-      // ── Step 2: Get chat messages ─────────────────────────────────────────
-      const c     = ctx();
-      const chat  = c.chat || [];
-      const count = Math.max(1, s.messageScanCount);
+      // ── Step 2: Get chat messages (Feature AI-4: scanOnlyNew support) ─────
+      const c    = ctx();
+      const chat = c.chat || [];
 
-      const msgs = chat
-        .slice(-count)
+      // chatId key — use character + chat file name if available, else fallback
+      const chatId = String(c.chatId || c.characterId || 'global');
+
+      let msgSlice;
+      let msgLabel;
+
+      if (s.scanOnlyNew && s.lastScans[chatId] != null) {
+        const lastIdx = s.lastScans[chatId];
+        const newMsgs = chat.slice(lastIdx);
+        if (!newMsgs.length) {
+          setScanInfo('ℹ️ No new messages since last scan.', 'info');
+          updateLastScanUI(chatId);
+          return;
+        }
+        msgSlice = newMsgs;
+        msgLabel = `${newMsgs.length} new message(s) since last scan`;
+      } else {
+        const count = Math.max(1, s.messageScanCount);
+        msgSlice    = chat.slice(-count);
+        msgLabel    = `last ${count} messages`;
+      }
+
+      const isGroup = !!c.groupId;
+      const msgs = msgSlice
         .filter(m => m?.mes && !m.is_system)
         .map(m => {
-          const role = m.is_user ? (c.name1 || 'User') : (m.name || c.name2 || 'AI');
+          let role;
+          if (m.is_user) {
+            role = c.name1 || 'User';
+          } else if (isGroup) {
+            role = m.name || 'AI';
+          } else {
+            role = m.name || c.name2 || 'AI';
+          }
           return `${role}: ${m.mes}`;
         });
 
@@ -357,8 +487,14 @@ Return your JSON operations array now.`;
       setScanInfo(`🤖 Asking AI… (${totalEntries} entries · ${msgs.length} msgs)`, 'info');
 
       // ── Step 3: Build prompt & call AI ────────────────────────────────────
-      const summary    = buildBookSummary(books);
-      const fullPrompt = buildFullPrompt(s.prompt, summary, msgs, count);
+      // Feature AI-1: character context
+      const charContext = s.includeCharContext ? buildCharacterContext(c) : '';
+
+      // Feature AI-2+3: relevance sorting + configurable preview
+      const recentText = msgs.join(' ');
+      const { summary, truncatedCount } = buildBookSummary(books, recentText, s);
+
+      const fullPrompt = buildFullPrompt(s.prompt, charContext, summary, msgs, msgLabel);
       const raw        = await aiGenerate(fullPrompt);
 
       if (!raw) {
@@ -369,8 +505,18 @@ Return your JSON operations array now.`;
       // ── Step 4: Parse response ────────────────────────────────────────────
       const ops = parseResponse(raw, books, s);
 
+      // Feature AI-4: save last scanned position after successful parse
+      s.lastScans[chatId] = chat.length;   // next scan starts from here
+      save();
+      updateLastScanUI(chatId);
+
       if (!ops.length) {
-        setScanInfo('ℹ️ AI found nothing to add or update.', 'info');
+        setScanInfo(
+          truncatedCount
+            ? `ℹ️ Nothing to update. ⚠️ ${truncatedCount} entr${truncatedCount > 1 ? 'ies were' : 'y was'} truncated in prompt — consider raising Entry preview limit.`
+            : 'ℹ️ AI found nothing to add or update.',
+          truncatedCount ? 'warn' : 'info'
+        );
         setStats({ books: bookCount, entries: totalEntries, msgs: msgs.length, suggested: 0 });
         return;
       }
@@ -382,10 +528,15 @@ Return your JSON operations array now.`;
 
       const counts = countByAction(ops);
       setStats({ books: bookCount, entries: totalEntries, msgs: msgs.length, suggested: ops.length });
+
+      // Feature AI-3: surface truncation warning alongside results
+      const truncWarn = truncatedCount
+        ? ` ⚠️ ${truncatedCount} truncated`
+        : '';
       setScanInfo(
         `✅ ${counts.create} new · ${counts.update} updated · ${counts.merge} merged · ` +
-        `${counts.forget} forgotten · ${counts.summarize} summarized`,
-        'ok'
+        `${counts.forget} forgotten · ${counts.summarize} summarized${truncWarn}`,
+        truncatedCount ? 'warn' : 'ok'
       );
 
       showReopenBtn(true);
@@ -400,11 +551,43 @@ Return your JSON operations array now.`;
     }
   }
 
+  // Feature AI-4: refresh the "last scan" status line in settings panel
+  function updateLastScanUI(chatId) {
+    const s      = getSettings();
+    const idx    = s.lastScans[chatId];
+    const $el    = $('#lau-last-scan-info');
+    if (!$el.length) return;
+    if (idx != null) {
+      const total = (ctx().chat || []).length;
+      $el.text(`Last scan: msg #${idx} of ${total}`).css('color', '#4ade80');
+    } else {
+      $el.text('Not scanned yet').css('color', '#475569');
+    }
+  }
+
   function countByAction(ops) {
     return ops.reduce((acc, op) => {
       acc[op.action] = (acc[op.action] || 0) + 1;
       return acc;
     }, { create: 0, update: 0, merge: 0, forget: 0, summarize: 0 });
+  }
+
+  // Feature 14: find existing entries whose keys overlap with the given list
+  function findKeyConflicts(keys) {
+    const lowerKeys = (keys || []).map(k => String(k).toLowerCase());
+    if (!lowerKeys.length) return [];
+    const hits = [];
+    for (const [bName, bData] of Object.entries(previewBooks)) {
+      for (const e of Object.values(bData.entries || {})) {
+        if (e.disable) continue;
+        const eKeys = (e.key || []).map(k => String(k).toLowerCase());
+        const shared = lowerKeys.filter(k => eKeys.includes(k));
+        if (shared.length) {
+          hits.push({ uid: e.uid, title: e.comment || `UID ${e.uid}`, book: bName, keys: shared });
+        }
+      }
+    }
+    return hits;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -522,6 +705,15 @@ Return your JSON operations array now.`;
     return null;
   }
 
+  // Search previewBooks for an entry by uid (used by diff view in cards)
+  function findEntryInAllBooks(uid) {
+    for (const data of Object.values(previewBooks)) {
+      const e = findEntryByUid(data.entries || {}, uid);
+      if (e) return e;
+    }
+    return null;
+  }
+
   async function applyOp(op) {
     if (!op.targetBook) throw new Error('No target lorebook specified for this operation.');
 
@@ -532,14 +724,16 @@ Return your JSON operations array now.`;
     if (op.action === 'create' || op.action === 'summarize') {
       // createWorldInfoEntry adds entry to data.entries and returns it
       const entry = wiCreate(op.targetBook, data);
+      const ed    = getSettings().entryDefaults;
       entry.comment   = op.comment;
       entry.content   = op.content;
       entry.key       = op.keys || [];
       entry.disable   = false;
-      entry.constant  = false;
-      entry.selective = false;
+      entry.constant  = !!ed.constant;
+      entry.selective = !!ed.selective;
       entry.addMemo   = !!op.comment;
-      entry.order     = 100;
+      entry.order     = ed.order ?? 100;
+      entry.position  = ed.position ?? 0;
       await wiSave(op.targetBook, data);
       logActivity(op.action, op.comment, op.targetBook);
       console.log(`[LAU] Created "${op.comment}" (UID ${entry.uid}) → "${op.targetBook}"`);
@@ -700,11 +894,94 @@ Return your JSON operations array now.`;
       ⚙️ Settings <span id="lau-settings-chev">▾</span>
     </div>
     <div id="lau-settings-body" style="display:none">
+
+      <!-- Feature AI-1/2/3/4: AI quality settings -->
+      <div class="lau-field">
+        <div class="lau-field-label">🧠 AI context &amp; prompt quality</div>
+
+        <div class="lau-frow" style="margin-top:4px; flex-wrap:wrap; gap:8px">
+
+          <!-- AI-1 -->
+          <label class="lau-ed-check" title="Adds character name, description, scenario and persona to the prompt so AI understands who is who">
+            <input type="checkbox" id="lau-char-ctx"> Include character context
+          </label>
+
+          <!-- AI-2 -->
+          <label class="lau-ed-check" title="Entries whose keywords appear in recent messages are shown first so AI prioritises them">
+            <input type="checkbox" id="lau-relevance"> Relevance sorting
+          </label>
+
+        </div>
+
+        <!-- AI-3 -->
+        <div class="lau-frow" style="margin-top:8px; align-items:center; gap:6px">
+          <span class="lau-lbl">Entry preview limit</span>
+          <input type="number" class="lau-num" id="lau-preview-chars" min="0" max="9999" style="width:64px" title="Max chars per entry sent to AI. 0 = unlimited.">
+          <span class="lau-lbl">chars &nbsp;<em style="color:#334155">(0 = unlimited)</em></span>
+        </div>
+
+        <!-- AI-4 -->
+        <div style="margin-top:8px; display:flex; flex-direction:column; gap:4px">
+          <label class="lau-ed-check" title="Only scan messages that arrived after the last successful scan">
+            <input type="checkbox" id="lau-scan-only-new"> Scan only new messages
+          </label>
+          <div style="display:flex; align-items:center; gap:6px; padding-left:2px">
+            <span class="lau-scan-info" id="lau-last-scan-info" style="font-style:normal; font-size:0.74em; color:#475569">Not scanned yet</span>
+            <button class="lau-btn lau-btn-xs" id="lau-reset-scan-pos" title="Forget last scan position — next scan will use the full message window">↺ Reset</button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Feature 7: Prompt presets -->
+      <div class="lau-field">
+        <div class="lau-field-label">💾 Prompt presets</div>
+        <div class="lau-presets-row">
+          <select class="lau-preset-sel" id="lau-preset-sel">
+            <option value="">— select preset —</option>
+          </select>
+          <button class="lau-btn lau-btn-xs" id="lau-preset-load" title="Load selected preset into editor">📂 Load</button>
+          <button class="lau-btn lau-btn-xs" id="lau-preset-save" title="Save current prompt as a new preset">💾 Save as…</button>
+          <button class="lau-btn lau-btn-xs lau-btn-del" id="lau-preset-del" title="Delete selected preset">🗑️</button>
+        </div>
+      </div>
+
       <div class="lau-field">
         <div class="lau-field-label">🤖 AI Prompt</div>
         <textarea class="lau-textarea" id="lau-prompt"></textarea>
         <button class="lau-btn" id="lau-reset-prompt" style="margin-top:5px">↩️ Reset to default</button>
       </div>
+
+      <!-- Feature 8: Entry defaults -->
+      <div class="lau-field">
+        <div class="lau-field-label">🆕 Defaults for new entries</div>
+        <div class="lau-frow" style="margin-top:4px">
+          <div class="lau-fg">
+            <div class="lau-fl">Insertion order</div>
+            <input type="number" class="lau-fi" id="lau-ed-order" min="0" max="999" style="width:70px">
+          </div>
+          <div class="lau-fg">
+            <div class="lau-fl">Position</div>
+            <select class="lau-fs" id="lau-ed-position">
+              <option value="0">↑ Before char</option>
+              <option value="1">↓ After char</option>
+              <option value="2">↑ Before AN</option>
+              <option value="3">↓ After AN</option>
+              <option value="4">↑ Before EM</option>
+              <option value="5">↓ After EM</option>
+            </select>
+          </div>
+        </div>
+        <div class="lau-frow" style="margin-top:6px">
+          <label class="lau-ed-check">
+            <input type="checkbox" id="lau-ed-constant"> Constant (always inject)
+          </label>
+          <label class="lau-ed-check">
+            <input type="checkbox" id="lau-ed-selective"> Selective (needs secondary keys)
+          </label>
+        </div>
+      </div>
+
     </div>
 
   </div>
@@ -714,6 +991,21 @@ Return your JSON operations array now.`;
     const s = getSettings();
     $('#lau-count').val(s.messageScanCount);
     $('#lau-prompt').val(s.prompt);
+    // Feature 8: entry defaults
+    $('#lau-ed-order').val(s.entryDefaults.order);
+    $('#lau-ed-position').val(s.entryDefaults.position);
+    $('#lau-ed-constant').prop('checked', s.entryDefaults.constant);
+    $('#lau-ed-selective').prop('checked', s.entryDefaults.selective);
+    // Feature 7: presets
+    populatePresetSelect();
+    // Features AI-1/2/3/4
+    $('#lau-char-ctx').prop('checked', s.includeCharContext);
+    $('#lau-relevance').prop('checked', s.relevanceSorting);
+    $('#lau-preview-chars').val(s.entryPreviewChars);
+    $('#lau-scan-only-new').prop('checked', s.scanOnlyNew);
+    // Refresh last-scan label
+    const chatId0 = String(ctx().chatId || ctx().characterId || 'global');
+    updateLastScanUI(chatId0);
 
     if (collapsed) $('#lau-body').hide();
 
@@ -843,6 +1135,16 @@ Return your JSON operations array now.`;
     }
   }
 
+  // Feature 7: populate the preset <select>
+  function populatePresetSelect() {
+    const presets = getSettings().promptPresets;
+    const $sel = $('#lau-preset-sel').empty();
+    $sel.append('<option value="">— select preset —</option>');
+    for (const name of Object.keys(presets).sort()) {
+      $sel.append(`<option value="${esc(name)}">${esc(name)}</option>`);
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // WIRE UI EVENTS
   // ═══════════════════════════════════════════════════════════════════════════
@@ -904,6 +1206,81 @@ Return your JSON operations array now.`;
       getSettings().prompt = DEFAULT_PROMPT;
       $('#lau-prompt').val(DEFAULT_PROMPT);
       save();
+    });
+
+    // Feature 7: preset controls
+    $('#lau-preset-load').on('click', () => {
+      const name    = $('#lau-preset-sel').val();
+      const presets = getSettings().promptPresets;
+      if (!name || !presets[name]) return;
+      getSettings().prompt = presets[name];
+      $('#lau-prompt').val(presets[name]);
+      save();
+    });
+
+    $('#lau-preset-save').on('click', () => {
+      const name = prompt('Save current prompt as preset:\nEnter a name:');
+      if (!name?.trim()) return;
+      const n = name.trim();
+      const s = getSettings();
+      s.promptPresets[n] = s.prompt;
+      save();
+      populatePresetSelect();
+      $('#lau-preset-sel').val(n);
+    });
+
+    $('#lau-preset-del').on('click', () => {
+      const name = $('#lau-preset-sel').val();
+      if (!name) return;
+      if (!confirm(`Delete preset "${name}"?`)) return;
+      delete getSettings().promptPresets[name];
+      save();
+      populatePresetSelect();
+    });
+
+    // Feature 8: entry defaults
+    $('#lau-ed-order').on('input', function () {
+      deb('edo', () => { getSettings().entryDefaults.order = Math.max(0, parseInt(this.value) || 100); save(); });
+    });
+    $('#lau-ed-position').on('change', function () {
+      getSettings().entryDefaults.position = parseInt(this.value) || 0; save();
+    });
+    $('#lau-ed-constant').on('change', function () {
+      getSettings().entryDefaults.constant = this.checked; save();
+    });
+    $('#lau-ed-selective').on('change', function () {
+      getSettings().entryDefaults.selective = this.checked; save();
+    });
+
+    // Feature AI-1
+    $('#lau-char-ctx').on('change', function () {
+      getSettings().includeCharContext = this.checked; save();
+    });
+
+    // Feature AI-2
+    $('#lau-relevance').on('change', function () {
+      getSettings().relevanceSorting = this.checked; save();
+    });
+
+    // Feature AI-3
+    $('#lau-preview-chars').on('input', function () {
+      deb('pvc', () => {
+        const v = parseInt(this.value);
+        getSettings().entryPreviewChars = isNaN(v) || v < 0 ? 1000 : v;
+        save();
+      });
+    });
+
+    // Feature AI-4
+    $('#lau-scan-only-new').on('change', function () {
+      getSettings().scanOnlyNew = this.checked; save();
+    });
+    $('#lau-reset-scan-pos').on('click', () => {
+      const s  = getSettings();
+      const id = String(ctx().chatId || ctx().characterId || 'global');
+      delete s.lastScans[id];
+      save();
+      updateLastScanUI(id);
     });
 
     // Scan button
@@ -978,6 +1355,17 @@ Return your JSON operations array now.`;
     const bookNames   = Object.keys(previewBooks);
     const bookOptHtml = bookNames.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
 
+    // Feature 18: build book meta info bar
+    const bookMetaHtml = bookNames.map(name => {
+      const meta = getBookMeta(name);
+      const tags = meta.tags ? meta.tags.split(',').map(t => t.trim()).filter(Boolean) : [];
+      return `<div class="lau-pop-book-meta">
+        <span class="lau-pop-book-name">📚 ${esc(name)}</span>
+        ${meta.description ? `<span class="lau-pop-book-desc">${esc(meta.description)}</span>` : ''}
+        ${tags.map(t => `<span class="lau-pop-book-tag">${esc(t)}</span>`).join('')}
+      </div>`;
+    }).join('');
+
     $('body').append(`
 <div id="lau-overlay">
   <div id="lau-popup">
@@ -999,6 +1387,8 @@ Return your JSON operations array now.`;
       <div class="lau-tab" data-f="forget">🗑️ Forget (${counts.forget})</div>
       <div class="lau-tab" data-f="summarize">📋 Summary (${counts.summarize})</div>
     </div>
+
+    ${bookMetaHtml ? `<div class="lau-pop-books-bar">${bookMetaHtml}</div>` : ''}
 
     <div id="lau-card-list"></div>
 
@@ -1051,7 +1441,20 @@ Return your JSON operations array now.`;
     // Body fields per action
     let bodyHtml = '';
     if (op.action === 'create' || op.action === 'summarize') {
+      // Feature 14: check for keyword conflicts
+      const conflicts = findKeyConflicts(op.keys);
+      const conflictHtml = conflicts.length
+        ? `<div class="lau-conflict-warn">
+            ⚠️ Keywords overlap with <b>${conflicts.length}</b> existing entr${conflicts.length > 1 ? 'ies' : 'y'}:
+            ${conflicts.map(c =>
+              `<span class="lau-conflict-pill" title="Book: ${esc(c.book)}">
+                UID ${c.uid} "${esc(c.title)}" [${c.keys.map(esc).join(', ')}]
+              </span>`
+            ).join('')}
+          </div>`
+        : '';
       bodyHtml = `
+        ${conflictHtml}
         <div class="lau-fg"><div class="lau-fl">Title</div>
           <input class="lau-fi f-comment" type="text" value="${esc(op.comment)}"></div>
         <div class="lau-fg"><div class="lau-fl">Content</div>
@@ -1064,12 +1467,31 @@ Return your JSON operations array now.`;
         </div>`;
 
     } else if (op.action === 'update') {
+      // Feature 2: show old content for diff
+      const oldEntry   = findEntryInAllBooks(op.uid);
+      const oldContent = oldEntry?.content ?? '';
+      const oldKeys    = (oldEntry?.key || []).join(', ');
+      const diffHtml   = oldEntry
+        ? `<div class="lau-diff-wrap">
+            <div class="lau-diff-col">
+              <div class="lau-diff-label">📄 Current content</div>
+              <div class="lau-diff-old">${esc(oldContent) || '<em style="color:#475569">empty</em>'}</div>
+              ${oldKeys ? `<div class="lau-diff-label" style="margin-top:6px">🔑 Current keys</div>
+              <div class="lau-diff-keys-old">${esc(oldKeys)}</div>` : ''}
+            </div>
+            <div class="lau-diff-col">
+              <div class="lau-diff-label">✏️ New content</div>`
+        : '';
+      const diffClose  = oldEntry ? `</div></div>` : '';
+
       bodyHtml = `
-        <div class="lau-info-pill">Updating UID <b>${op.uid}</b></div>
+        <div class="lau-info-pill">Updating UID <b>${op.uid}</b>${oldEntry?.comment ? ` — "${esc(oldEntry.comment)}"` : ''}</div>
+        ${diffHtml}
         <div class="lau-fg"><div class="lau-fl">New title <em>(optional — leave blank to keep)</em></div>
           <input class="lau-fi f-comment" type="text" value="${esc(op.comment || '')}"></div>
         <div class="lau-fg"><div class="lau-fl">Full updated content</div>
           <textarea class="lau-ft f-content">${esc(op.content || '')}</textarea></div>
+        ${diffClose}
         <div class="lau-frow">
           <div class="lau-fg"><div class="lau-fl">Keywords</div>
             <input class="lau-fi f-keys" type="text" value="${esc((op.keys || []).join(', '))}"></div>

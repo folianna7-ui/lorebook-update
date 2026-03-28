@@ -610,3 +610,171 @@
   background: rgba(251, 191, 36, 0.15);
   border-color: rgba(251, 191, 36, 0.6);
 }
+
+/* ── Feature 7: Prompt presets ────────────────────────────────── */
+
+.lau-presets-row {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.lau-presets-row .lau-preset-sel {
+  flex: 1;
+  min-width: 100px;
+  padding: 4px 7px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  color: #e2e8f0;
+  font-size: 0.82em;
+}
+.lau-presets-row .lau-preset-sel:focus { outline: none; border-color: #3b82f6; }
+
+/* ── Feature 8: Entry defaults checkboxes ────────────────────── */
+
+.lau-ed-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8em;
+  color: #94a3b8;
+  cursor: pointer;
+  user-select: none;
+  padding: 3px 0;
+}
+.lau-ed-check input[type="checkbox"] { cursor: pointer; }
+
+/* ── Feature 14: Keyword conflict warning ────────────────────── */
+
+.lau-conflict-warn {
+  background: rgba(251, 191, 36, 0.08);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  border-left: 3px solid #fbbf24;
+  border-radius: 5px;
+  padding: 7px 10px;
+  font-size: 0.78em;
+  color: #fcd34d;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.lau-conflict-warn b { color: #fde68a; }
+
+.lau-conflict-pill {
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  border-radius: 4px;
+  padding: 2px 7px;
+  color: #fde68a;
+  font-size: 0.88em;
+  cursor: default;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+/* ── Feature 2: Diff view (update action) ────────────────────── */
+
+.lau-diff-wrap {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.lau-diff-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.lau-diff-label {
+  font-size: 0.69em;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding-bottom: 2px;
+}
+
+.lau-diff-old {
+  min-height: 60px;
+  max-height: 160px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  background: rgba(248, 113, 113, 0.06);
+  border: 1px solid rgba(248, 113, 113, 0.2);
+  border-radius: 4px;
+  font-size: 0.78em;
+  color: #94a3b8;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+.lau-diff-keys-old {
+  padding: 4px 7px;
+  background: rgba(248, 113, 113, 0.06);
+  border: 1px solid rgba(248, 113, 113, 0.15);
+  border-radius: 4px;
+  font-size: 0.78em;
+  color: #94a3b8;
+  font-family: monospace;
+}
+
+/* ── Feature 18: Book meta bar in popup ─────────────────────── */
+
+.lau-pop-books-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 18px;
+  background: rgba(0, 0, 0, 0.12);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+
+.lau-pop-book-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 3px 8px;
+  background: rgba(59, 130, 246, 0.07);
+  border: 1px solid rgba(59, 130, 246, 0.18);
+  border-radius: 5px;
+}
+
+.lau-pop-book-name {
+  font-size: 0.77em;
+  font-weight: bold;
+  color: #93c5fd;
+}
+
+.lau-pop-book-desc {
+  font-size: 0.74em;
+  color: #94a3b8;
+  font-style: italic;
+}
+
+.lau-pop-book-tag {
+  font-size: 0.68em;
+  padding: 2px 7px;
+  background: rgba(59, 130, 246, 0.15);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  border-radius: 10px;
+  color: #60a5fa;
+  white-space: nowrap;
+}
+
+/* ── Feature AI-4: last scan info in settings ────────────────── */
+#lau-last-scan-info {
+  font-size: 0.74em;
+  color: #475569;
+  font-style: normal;
+}
