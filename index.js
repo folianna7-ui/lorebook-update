@@ -105,6 +105,8 @@ If nothing meaningful happened: {"operations": []}`;
     relevanceSorting:   true,  // show keyword-matching entries first
     scanOnlyNew:        false, // scan only messages since last successful scan
     lastScans:          {},    // { [chatId]: lastMsgIndex } — persisted per chat
+    // Fix: generation mode
+    bypassPreset:       true,  // true = direct API call, bypassing ST preset/context
   };
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -140,6 +142,7 @@ If nothing meaningful happened: {"operations": []}`;
     if (typeof s.relevanceSorting !== 'boolean')   s.relevanceSorting  = true;
     if (typeof s.scanOnlyNew !== 'boolean')        s.scanOnlyNew       = false;
     if (!s.lastScans || typeof s.lastScans !== 'object') s.lastScans   = {};
+    if (typeof s.bypassPreset !== 'boolean')       s.bypassPreset      = true;
     return s;
   }
 
@@ -216,10 +219,69 @@ If nothing meaningful happened: {"operations": []}`;
     return null;
   }
 
-  async function aiGenerate(fullPrompt) {
-    const c = ctx();
+  // FIX 1: strip <think>…</think> reasoning blocks (DeepSeek-R1, QwQ, etc.)
+  // Also strips any other XML-like wrapper tags models sometimes add.
+  function stripReasoningTags(text) {
+    return text
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')   // DeepSeek-R1 / QwQ
+      .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '') // some Anthropic variants
+      .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '')
+      .trim();
+  }
 
-    // 1. generateRaw — uses the active ST connection profile
+  // FIX 2: direct API call that bypasses ST preset, jailbreaks and chat history.
+  // Only the lorebook prompt is sent — no extra context bleeding in.
+  async function generateDirect(fullPrompt) {
+    // Try chat-completions endpoint first (OpenAI-compatible: most providers)
+    try {
+      const resp = await fetch('/api/backends/chat-completions/generate', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages:   [{ role: 'user', content: fullPrompt }],
+          stream:     false,
+          max_tokens: 2000,
+        }),
+      });
+      if (resp.ok) {
+        const t = extractText(await resp.json());
+        if (t?.trim()) return t.trim();
+      }
+    } catch (e) { console.warn('[LAU] direct chat-completions failed:', e.message); }
+
+    // Fallback: text-completion endpoint (KoboldCPP, llama.cpp, etc.)
+    try {
+      const resp = await fetch('/api/generate', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt:         fullPrompt,
+          max_new_tokens: 2000,
+          stream:         false,
+        }),
+      });
+      if (resp.ok) {
+        const t = extractText(await resp.json());
+        if (t?.trim()) return t.trim();
+      }
+    } catch (e) { console.warn('[LAU] direct /api/generate failed:', e.message); }
+
+    return null;
+  }
+
+  async function aiGenerate(fullPrompt) {
+    const c  = ctx();
+    const s  = getSettings();
+
+    // ── Mode A: Bypass preset — direct API call, no ST context injection ──────
+    if (s.bypassPreset) {
+      const r = await generateDirect(fullPrompt);
+      if (r) return r;
+      // If direct failed (e.g. no API configured yet), warn and fall through
+      console.warn('[LAU] bypassPreset direct call failed — falling back to generateRaw');
+    }
+
+    // ── Mode B: Use ST connection normally (presses through preset + history) ──
     if (typeof c.generateRaw === 'function') {
       try {
         const r = await c.generateRaw(fullPrompt, '', false, false, '', 'normal');
@@ -227,7 +289,6 @@ If nothing meaningful happened: {"operations": []}`;
       } catch (e) { console.warn('[LAU] generateRaw failed:', e.message); }
     }
 
-    // 2. generateQuietPrompt — older ST versions
     if (typeof c.generateQuietPrompt === 'function') {
       try {
         const r = await c.generateQuietPrompt(fullPrompt, false, false);
@@ -235,23 +296,10 @@ If nothing meaningful happened: {"operations": []}`;
       } catch (e) { console.warn('[LAU] generateQuietPrompt failed:', e.message); }
     }
 
-    // 3. ST proxy endpoints
-    for (const { url, body } of [
-      { url: '/api/backends/chat-completions/generate',
-        body: { messages: [{ role: 'user', content: fullPrompt }], stream: false } },
-      { url: '/api/generate',
-        body: { prompt: fullPrompt, max_new_tokens: 2000, stream: false } },
-    ]) {
-      try {
-        const resp = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        if (!resp.ok) continue;
-        const t = extractText(await resp.json());
-        if (t?.trim()) return t.trim();
-      } catch { /* try next */ }
+    // Last resort: direct call regardless of bypassPreset setting
+    if (!s.bypassPreset) {
+      const r = await generateDirect(fullPrompt);
+      if (r) return r;
     }
 
     throw new Error('No active AI connection. Set one up in SillyTavern first.');
@@ -597,8 +645,11 @@ Return your JSON operations array now.`;
   const VALID_ACTIONS = new Set(['create', 'update', 'merge', 'forget', 'summarize']);
 
   function parseResponse(raw, books, s) {
+    // FIX 1: strip <think> / <thinking> / <reasoning> blocks from reasoning models
+    const stripped = stripReasoningTags(raw);
+
     // Strip markdown fences if present
-    const text = raw.trim()
+    const text = stripped.trim()
       .replace(/^```(?:json)?\s*/i, '')
       .replace(/\s*```\s*$/i, '');
 
@@ -911,6 +962,11 @@ Return your JSON operations array now.`;
             <input type="checkbox" id="lau-relevance"> Relevance sorting
           </label>
 
+          <!-- FIX 2: bypass preset -->
+          <label class="lau-ed-check" title="Send only the lorebook prompt to the AI — bypasses your ST preset, jailbreaks and chat history. Fixes context overflow and prevents the scan from interfering with your story generation settings. Recommended: ON.">
+            <input type="checkbox" id="lau-bypass-preset"> Bypass ST preset <span class="lau-bypass-hint">(recommended)</span>
+          </label>
+
         </div>
 
         <!-- AI-3 -->
@@ -1003,6 +1059,8 @@ Return your JSON operations array now.`;
     $('#lau-relevance').prop('checked', s.relevanceSorting);
     $('#lau-preview-chars').val(s.entryPreviewChars);
     $('#lau-scan-only-new').prop('checked', s.scanOnlyNew);
+    // FIX 2: bypass preset
+    $('#lau-bypass-preset').prop('checked', s.bypassPreset);
     // Refresh last-scan label
     const chatId0 = String(ctx().chatId || ctx().characterId || 'global');
     updateLastScanUI(chatId0);
@@ -1252,7 +1310,12 @@ Return your JSON operations array now.`;
       getSettings().entryDefaults.selective = this.checked; save();
     });
 
-    // Feature AI-1
+    // FIX 2: bypass preset
+    $('#lau-bypass-preset').on('change', function () {
+      getSettings().bypassPreset = this.checked; save();
+    });
+
+    // Feature AI-1: char context
     $('#lau-char-ctx').on('change', function () {
       getSettings().includeCharContext = this.checked; save();
     });

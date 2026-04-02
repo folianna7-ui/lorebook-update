@@ -778,3 +778,11 @@
   color: #475569;
   font-style: normal;
 }
+
+/* ── Bypass preset hint label ─────────────────────────────────── */
+.lau-bypass-hint {
+  font-size: 0.82em;
+  color: #4ade80;
+  margin-left: 3px;
+  font-style: italic;
+}
